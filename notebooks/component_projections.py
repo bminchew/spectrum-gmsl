@@ -1,0 +1,1917 @@
+"""
+Component decomposition projection and export functions.
+
+Kept in a module so that the notebooks stay free of function
+definitions.  All functions operate in SLR convention
+(positive = sea level rise) and SI-derived internal units (meters, °C, yr).
+"""
+
+import json
+import os
+from pathlib import Path
+
+import netCDF4 as nc
+import numpy as np
+import pandas as pd
+from scipy.special import expit
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+try:
+    from slr_forecast.config import BASELINE_YEAR, N_SAMPLES, WAIS_ONSET_YEAR
+    from slr_forecast import M_TO_MM
+except ImportError as e:
+    raise ImportError(
+        "slr_forecast is not importable: install it with 'pip install -e .' "
+        "from the repository root, or run in the container "
+        "(environment/README.md)") from e
+
+
+# =========================================================================
+# A4 WAIS deep-uncertainty framework
+# =========================================================================
+
+# ---------------------------------------------------------------------------
+# A4 WAIS scenario parameters
+#
+# Each scenario specifies:
+#   P        – mixture weight (must sum to 1)
+#   low_mm   – 5th-percentile SLR at 2100 (mm)
+#   high_mm  – 95th-percentile SLR at 2100 (mm)
+#   alpha    – skew-normal shape parameter in log-space
+#              alpha > 0: positive skew (heavy right tail, Robel et al. 2019)
+#              alpha < 0: negative skew (mode toward upper range)
+#              alpha = 0: symmetric (reduces to log-normal)
+#   beta_loc – log-mean of trajectory exponent β (power-law time ramp)
+#   beta_scale – log-std of trajectory exponent β
+#              β = 1: linear (constant rate)
+#              β > 1: accelerating (back-loaded, MISI dynamics)
+#              On retrograde beds, grounding-line flux grows as the
+#              grounding line retreats into deeper water (Schoof 2007), so
+#              cumulative loss accelerates as (t − t₀)^β with β > 1.
+#   misi     – whether MISI is active (informational flag)
+#
+# S1: Status quo — current discharge, no instability. Sampled directly
+#     from a Bayesian quadratic-in-time fit to the observed IMBIE WAIS
+#     record (component_wais.ipynb, fit_imbie_time_model) rather than the skew-normal
+#     'low_mm'/'high_mm'/'alpha' parametrization used for S2: since S1 has
+#     no MISI by construction, the most direct "nothing new happens"
+#     baseline is the naive statistical continuation of what has actually
+#     been observed, requiring no assumption about future ocean-warming
+#     magnitude or melt-discharge sensitivity coefficients. See
+#     get_s1_quadratic() and _sample_s1_quadratic_mm() below.
+#     `low_mm`/`high_mm`/`alpha`/`beta_loc`/`beta_scale` are
+#     not defined for S1 and are not read by the sampling functions below.
+# S2: Fast WAIS (MISI + MICI) — marine ice sheet instability, with or
+#     without cascading ice-cliff failure. There is no physically
+#     defensible case for MISI proceeding without amplification from processes that models omit
+#     (Martin et al. 2026, AGU Advances), so "moderate MISI" and "MISI+MICI" are
+#     treated as one probability-weighted regime rather than two competing
+#     branches. Its 95th-percentile bound is high_mm=1300 mm, the IPCC AR6
+#     low-confidence AIS storyline's p95 under SSP5-8.5 (Fox-Kemper et al.
+#     2021: 1309 mm), rounded (see the dict entry below; the validation
+#     cell in component_wais.ipynb prints the mixture's own p95).
+#     Independent values for comparison: the Amundsen Sea Embayment's ice
+#     volume above flotation plus spillover to neighboring basins
+#     (~1.1 m; Morlighem et al. 2020), Bamber et al. (2019)'s WAIS 95th
+#     percentile at +5C (930 mm), and DeConto &
+#     Pollard (2016)'s most aggressive MICI projection (0.64-1.14 m total
+#     Antarctic). Its 5th-percentile bound
+#     (low_mm, about 84 mm) is pinned to the 50th percentile (median) of
+#     S1_status_quo's 2100 endpoint distribution. NOTE: at the median,
+#     S2's floor sits in the *middle* of S1's own distribution rather
+#     than above its upper tail -- about half of S1's possible outcomes
+#     exceed S2's floor. This means S2 is not strictly "worse than any
+#     plausible no-instability outcome"; its low end overlaps the bulk of
+#     S1's own spread. See _sample_s1_quadratic_mm() and S1_ISMIP6_STD_COEFFS
+#     above for the current S1 distribution this is computed from. To
+#     regenerate: draw a large sample (e.g. N=2,000,000) from
+#     _sample_s1_quadratic_mm(N, rng, [2100.0]) or sample_a4_wais_endpoint
+#     (N, rng, scenario_overrides={'weights': {'S1_status_quo': 1.0,
+#     'S2_fast_wais': 0.0}}) and read off the median (mm). `alpha=3`
+#     gives the endpoint distribution a
+#     right skew, reflecting the grounding-line flux nonlinearity that
+#     amplifies uncertainty toward greater ice loss once MISI is
+#     triggered (Robel et al. 2019); alpha only reshapes the distribution
+#     between its fixed 5th/95th percentile bounds (which do not depend
+#     on alpha), and the mixture is insensitive to its precise value
+#     (median shifts by at most 0.13 m across alpha in [0, 4] -- see the
+#     skewness sensitivity cell in component_wais.ipynb).
+# ---------------------------------------------------------------------------
+
+A4_SCENARIOS = {
+    'S1_status_quo': {'P': 0.10, 'misi': False},
+    # low_mm: 50th percentile (median) of S1_status_quo's 2100 endpoint
+    # distribution (~84 mm) INCLUDING the ISMIP6 extrapolation-error
+    # widening (S1_ISMIP6_STD_COEFFS above). NOTE: at the median, S2's
+    # floor does not sit above S1's tail; see the paragraph above for this
+    # rule's caveat.
+    # high_mm and beta_loc are clean rounded values: 1300 mm is the IPCC
+    # AR6 low-confidence AIS p95 under SSP5-8.5 (1309 mm) rounded; median
+    # beta 2 is a clean value. Both are adopted values describing the
+    # qualitative shape suggested by the literature, not derived from physics.
+    # low_mm is DERIVED, not stored: set_s1_quadratic() fills it from the
+    # installed fit via s1_median_mm(), so the S2 floor follows the S1
+    # median automatically instead of drifting out of step with it when
+    # the fit is regenerated.  None here means "no fit installed yet".
+    'S2_fast_wais':  {'P': 0.90, 'low_mm': None, 'high_mm': 1300,
+                      'alpha': 3.0,
+                      'beta_loc': np.log(2.0), 'beta_scale': 0.3,
+                      'misi': True},
+}
+
+# ---------------------------------------------------------------------------
+# S1_status_quo: direct posterior sampling (quadratic-in-time fit)
+#
+# S1 has no MISI by construction, so unlike S2 -- whose bounds are adopted
+# values (see A4_SCENARIOS above) -- S1 is grounded directly in the
+# observed IMBIE-3 WAIS record via a Bayesian quadratic-in-time fit
+# (kinematics form -- position under constant acceleration):
+#     rate(t) = a*(t-2000) + v,   H(t) = 0.5*a*(t-2000)^2 + v*(t-2000) + H0
+# fit to IMBIE-3 1979-2023 (Otosaka et al. 2026; component_wais.ipynb,
+# component_analysis.fit_imbie_time_model on independent annual increments,
+# which replaced bayesian_models.fit_bayesian_level; a signed Normal prior on the
+# acceleration a since a purely time-based fit has no directional
+# physical constraint -- WAIS's own record shows both acceleration and
+# deceleration). The naive continuation of this fit is the most direct
+# "nothing new happens" baseline available: it needs no assumption about
+# future ocean-warming magnitude or melt-discharge sensitivity, unlike
+# a forward physical scaling chain from ocean warming to discharge.
+#
+# The S1 quadratic is (a, v, H0) in (m/yr^2, m/yr, m), with the posterior
+# covariance of fit_imbie_time_model, whose increment likelihood is already
+# correlation-aware for the cumulative record. (It previously came from
+# component_levelspace_robust_se.robust_level_intervals, a post-hoc repair
+# of the independent-point likelihood of fit_bayesian_level.)
+#
+# These are NOT hardcoded.  They are inherited from the fit that produces
+# them, by one of two routes:
+#
+#   set_s1_quadratic(mean, cov)   component_wais.ipynb calls this (via
+#                                 save_s1_quadratic) in the fit cell,
+#                                 right after fit_imbie_time_model.  This
+#                                 route is required, not merely
+#                                 convenient: that notebook's projection
+#                                 cells run BEFORE its save_wais cell, so
+#                                 within a single run there is no stored
+#                                 copy for them to read.  Do not remove
+#                                 the setter in favor of the loader.
+#
+#   load_s1_quadratic()           every other consumer (results_figures,
+#                                 the tests, and anything else calling the
+#                                 A4 samplers without refitting) reads
+#                                 s1_quadratic_fit.json, which the WAIS
+#                                 notebook writes beside this module.
+#                                 get_s1_quadratic() calls this lazily on
+#                                 first use, so callers normally do
+#                                 nothing.
+#
+# The fit lives in a small tracked JSON file rather than in
+# component_results.h5 deliberately: the h5 is gitignored bulk output, so
+# putting it there would make a fresh clone unable to run the WAIS tests,
+# and would hide changes to the fit from review.  At ~600 bytes this file
+# belongs in version control, where a refit shows up as a readable diff.
+#
+# There is deliberately no hardcoded fallback.  A stale copy of this fit
+# is exactly the failure this indirection exists to prevent: it is
+# invisible, it survives a clean re-run, and it silently decouples the
+# projections from the record they claim to be fitted to.  If neither
+# route has supplied values, get_s1_quadratic() raises.
+_S1_QUADRATIC = None    # (mean, cov, provenance) once set
+
+
+def set_s1_quadratic(mean, cov, provenance='set_s1_quadratic()'):
+    """Install the fitted S1 quadratic (a, v, H0) mean and covariance.
+
+    Parameters
+    ----------
+    mean : array-like, shape (3,)
+        ``(a, v, H0)`` in (m/yr^2, m/yr, m), from
+        ``component_analysis.fit_imbie_time_model`` in component_wais.
+    cov : array-like, shape (3, 3)
+        The posterior covariance for the same three parameters.
+    provenance : str
+        Free-text note on where the values came from, echoed by
+        ``describe_s1_quadratic()`` so a stale read is visible.
+    """
+    global _S1_QUADRATIC
+    mean = np.asarray(mean, dtype=float)
+    cov = np.asarray(cov, dtype=float)
+    if mean.shape != (3,):
+        raise ValueError(f'S1 quadratic mean must have shape (3,), got {mean.shape}')
+    if cov.shape != (3, 3):
+        raise ValueError(f'S1 quadratic cov must have shape (3, 3), got {cov.shape}')
+    if not np.allclose(cov, cov.T, rtol=1e-10, atol=1e-20):
+        raise ValueError('S1 quadratic cov is not symmetric')
+    eigmin = np.linalg.eigvalsh(cov).min()
+    if eigmin < -1e-12 * max(np.abs(cov).max(), 1e-30):
+        raise ValueError(
+            f'S1 quadratic cov is not positive semidefinite (min eigenvalue '
+            f'{eigmin:.3e}).  This is the signature of a covariance built '
+            f'from a cumulative sigma that was not re-anchored to the rebase '
+            f'epoch -- see component_analysis.annualize_imbie.')
+    _S1_QUADRATIC = (mean, cov, provenance)
+    # Keep the derived S2 floor in step with the fit it is defined from.
+    A4_SCENARIOS['S2_fast_wais']['low_mm'] = s1_median_mm()
+    return mean, cov
+
+
+S2_LOW_MM_RULE_YEAR = 2100.0
+
+
+def s1_median_mm(year=S2_LOW_MM_RULE_YEAR):
+    """Median S1_status_quo endpoint at *year*, in mm above BASELINE_YEAR.
+
+    Closed form rather than Monte Carlo: H(t) is linear in (a, v, H0) and
+    the ISMIP6 extrapolation-error term added by _sample_s1_quadratic_mm
+    is zero-mean, so the median is just the fit evaluated at its mean.
+    That makes this exact and seed-free, where sampling it would add
+    noise and a seed dependence to a scenario parameter.
+    """
+    mean = _S1_QUADRATIC[0]
+    tau = float(year) - BASELINE_YEAR
+    return (0.5 * mean[0] * tau ** 2 + mean[1] * tau + mean[2]) * M_TO_MM
+
+
+S1_QUADRATIC_PATH = Path(__file__).resolve().parent / 's1_quadratic_fit.json'
+
+
+def save_s1_quadratic(mean, cov, path=None, provenance='', fitted_at=None):
+    """Write the fitted S1 quadratic to the tracked JSON, and install it.
+
+    Called by component_wais.ipynb after the fit.  Keep the resulting
+    file in version control: it is the single source of truth for the
+    S1_status_quo shape, and a refit should be visible in review.
+
+    If the file already holds the same mean, covariance and provenance, it
+    is left untouched, so an identical refit does not show up as a git diff
+    of the ``fitted_at`` stamp alone.
+    """
+    from datetime import datetime, timezone
+    mean, cov = set_s1_quadratic(mean, cov, provenance=provenance or 'fresh fit')
+    path = Path(path) if path is not None else S1_QUADRATIC_PATH
+    if path.exists() and fitted_at is None:
+        try:
+            old = json.loads(path.read_text())
+            if (old.get('provenance') == provenance
+                    and np.array_equal(np.asarray(old['mean']), mean)
+                    and np.array_equal(np.asarray(old['cov']), cov)):
+                return path
+        except (ValueError, KeyError):
+            pass
+    payload = {
+        'mean': mean.tolist(),
+        'cov': cov.tolist(),
+        'order': ['a', 'v', 'H0'],
+        'units': {'a': 'm/yr^2', 'v': 'm/yr', 'H0': 'm'},
+        'provenance': provenance,
+        'fitted_at': fitted_at or datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(payload, indent=2) + '\n')
+    return path
+
+
+def load_s1_quadratic(path=None):
+    """Load and install the S1 quadratic from the tracked JSON."""
+    path = Path(path) if path is not None else S1_QUADRATIC_PATH
+    if not path.exists():
+        raise FileNotFoundError(
+            f'{path} does not exist.  Run component_wais.ipynb, whose fit '
+            f'cell writes it via save_s1_quadratic().')
+    payload = json.loads(path.read_text())
+    return set_s1_quadratic(
+        payload['mean'], payload['cov'],
+        provenance=f"{path.name} ({payload.get('provenance', 'no provenance')}"
+                   f", fitted {payload.get('fitted_at', 'unknown')})")
+
+
+def get_s1_quadratic():
+    """Return the ``(mean, cov)`` in force, loading from the store if needed."""
+    if _S1_QUADRATIC is None:
+        try:
+            load_s1_quadratic()
+        except (OSError, KeyError, ValueError) as exc:
+            raise RuntimeError(
+                'The S1 quadratic (a, v, H0) fit has not been supplied.  '
+                'Either call set_s1_quadratic(mean, cov) after fitting (what '
+                'component_wais.ipynb does), or run component_wais.ipynb so '
+                f'{S1_QUADRATIC_PATH.name} is written for load_s1_quadratic() '
+                f'to read.  '
+                f'Load attempt failed with: {exc}') from exc
+    return _S1_QUADRATIC[0], _S1_QUADRATIC[1]
+
+
+def describe_s1_quadratic():
+    """One-line provenance of the S1 quadratic currently in force."""
+    if _S1_QUADRATIC is None:
+        return 'S1 quadratic: not set'
+    mean, _, prov = _S1_QUADRATIC
+    return (f'S1 quadratic: a={mean[0] * 1e3:.4f} mm/yr^2, '
+            f'v={mean[1] * 1e3:.4f} mm/yr  [{prov}]')
+
+# ---------------------------------------------------------------------------
+# S1_status_quo: external extrapolation-error covariance (ISMIP6 emulator)
+#
+# The S1 quadratic above captures how well IMBIE-3's 45-yr record
+# constrains a *fixed* constant-acceleration curve -- i.e. parameter
+# uncertainty for an assumed-correct model shape. It does NOT capture the
+# risk that a strictly constant-acceleration extrapolation is itself a
+# poor description of non-MISI WAIS dynamics 75+ years past the
+# calibration window (2150 is ~1.9x the record length past the anchor).
+# A 44-47-yr record cannot inform how fast that extrapolation error
+# should grow with lead time -- the same reasoning already used elsewhere
+# in this project to import, rather than fit, a long-horizon parameter
+# from too-short a record (component_ocean.ipynb fixes the deep-ocean
+# relaxation time tau_d=150 yr at the Geoffroy et al. (2013) CMIP5
+# multi-model mean rather than fit it to the 21-yr ocean record).
+#
+# Framing (Tarantola, 2005, "Inverse Problem Theory"): total predictive
+# covariance = data/parameter covariance (the S1 quadratic cov, well
+# constrained by IMBIE-3) + a "theory"/extrapolation-error covariance
+# that our own short record cannot resolve, estimated here from an
+# independent, external, peer-reviewed source instead: the IPCC AR6
+# ISMIP6 emulator's WAIS-specific projection (medium confidence; already
+# a "no exotic instability" ice-sheet-model ensemble, and the same one
+# shown in component_wais_pdf_exceedance_ipcc_p_s1_sweep.png).
+#
+# _sample_s1_quadratic_mm() adds ONE eta ~ N(0,1) per Monte Carlo sample
+# (not per year, so each trajectory stays smooth) times sqrt(extra_var(t)):
+#     H_S1(t) = H_quad(t) + eta * sqrt(extra_var(t))
+#     extra_var(t) = max(0, std_ISMIP6(t)^2 - std_ISMIP6(anchor_year)^2)
+# By construction extra_var(anchor_year) = 0 exactly (regardless of what
+# `anchor_year` is passed at call time), so S1 stays anchored to the
+# observed IMBIE value with no added spread there, and only widens for
+# years after the anchor.
+#
+# std_ISMIP6(t) is a quadratic fit (elapsed time since the fit anchor)
+# to the 9 native decadal points (2020-2100) of
+# data/raw/ipcc_ar6/slr/ar6/global/dist_components/
+# icesheets-ipccar6-ismipemuicesheet-ssp245_WAIS_globalsl.nc, read via
+# slr_data_readers.read_ipcc_ar6_component(component_dir=..., component_type=
+# 'icesheets', sub_component='WAIS', model='ipccar6-ismipemuicesheet',
+# scenario='ssp245', convert_to_meters=True). ssp245 used as reference:
+# WAIS's ISMIP6 std(2100) varies <5% across SSP1-2.6 to SSP5-8.5
+# (59.7-62.1 mm), consistent with S1 being SSP-independent by
+# construction.
+#
+# The fit is on std(t), NOT Var(t)=std(t)^2, directly: a quadratic fit to
+# Var(t) itself has a spurious interior minimum (var dips to a negative
+# value around 2042, R^2=0.947 despite the bad shape) because ISMIP6's
+# variance grows slowly 2020-2050 then much faster after, a shape a
+# single quadratic in VARIANCE cannot track without an unphysical dip.
+# Fitting std(t) (which grows closer to quadratically in time) and
+# squaring afterward is well-behaved (R^2=0.994, residuals <=2.3 mm, and
+# the resulting extra_var(t) is exactly monotonically non-decreasing from
+# the anchor year out to 2150 -- verified when the fit was made).
+#
+# S1_ISMIP6_FIT_ANCHOR_YEAR is the anchor year (last IMBIE-3 observation,
+# wais_year[-1]) AT THE TIME THIS FIT WAS PERFORMED -- it is where the
+# elapsed-time variable `e` in the polynomial is centered, not
+# necessarily identical to whatever `anchor_year` argument
+# _sample_s1_quadratic_mm() receives at call time (extra_var(anchor_year)
+# is always exactly 0 regardless, since both std(anchor_year) terms use
+# the same fixed curve). To regenerate after IMBIE-3 or the ISMIP6
+# emulator file are updated, rerun the fit:
+#   df = read_ipcc_ar6_component(CONF_BASE, 'icesheets', 'WAIS',
+#            'ipccar6-ismipemuicesheet', 'ssp245', convert_to_meters=True)
+#   e = df.index.values - anchor_year   # anchor_year = wais_year[-1]
+#   coeffs = np.polyfit(e, df['std'].values, 2)
+S1_ISMIP6_FIT_ANCHOR_YEAR = 2023.5
+S1_ISMIP6_STD_COEFFS = np.array([1.00993537e-05, -5.14603524e-05,
+                                  3.27977164e-03])  # meters; std(t) = c2*e^2+c1*e+c0
+
+
+def _s1_ismip6_std_m(years):
+    """std_ISMIP6(t) [m], quadratic in elapsed time since
+    S1_ISMIP6_FIT_ANCHOR_YEAR (see S1_ISMIP6_STD_COEFFS comment above)."""
+    e = np.asarray(years, dtype=float) - S1_ISMIP6_FIT_ANCHOR_YEAR
+    c2, c1, c0 = S1_ISMIP6_STD_COEFFS
+    return c2 * e ** 2 + c1 * e + c0
+
+
+def _s1_ismip6_extra_var_m2(years, anchor_year):
+    """extra_var(t) = max(0, std_ISMIP6(t)^2 - std_ISMIP6(anchor_year)^2),
+    the ISMIP6-external extrapolation-error variance added to S1 beyond
+    `anchor_year` (see S1_ISMIP6_STD_COEFFS comment block above). Exactly
+    0 at t=anchor_year by construction, for any anchor_year.
+    """
+    std_t = _s1_ismip6_std_m(years)
+    std_anchor = _s1_ismip6_std_m(anchor_year)
+    return np.maximum(0.0, std_t ** 2 - std_anchor ** 2)
+
+
+def _sample_s1_quadratic_mm(n_samples, rng, years, anchor_year=None):
+    """Direct-posterior S1_status_quo draws (mm): the quadratic-in-time
+    fit to observed IMBIE WAIS mass balance (see get_s1_quadratic())
+    PLUS an external ISMIP6-emulator-derived extrapolation-error term
+    (S1_ISMIP6_STD_COEFFS) that grows the spread at long lead times
+    beyond what IMBIE-3's 45-yr record alone can constrain -- see the
+    S1_ISMIP6_STD_COEFFS comment block above for the full derivation and
+    Tarantola (2005) framing.
+
+    This is the single shared implementation used by both
+    sample_a4_wais_endpoint() and sample_a4_wais_trajectories() so the
+    two sampling paths stay consistent.
+
+    Parameters
+    ----------
+    n_samples : int
+    rng : numpy.random.Generator
+    years : array-like
+        Query years.
+    anchor_year : float or None
+        Year at which the ISMIP6 extra-variance term is exactly zero
+        (S1 stays anchored to the observed IMBIE value there with no
+        added spread). Defaults to S1_ISMIP6_FIT_ANCHOR_YEAR when not
+        given (used by sample_a4_wais_endpoint(), which has no separate
+        anchor-splicing logic); sample_a4_wais_trajectories() passes its
+        own dynamic anchor_year (the last IMBIE-3 observation year at
+        call time) so the extra term vanishes exactly at the same point
+        the trajectory itself splices onto the observed record.
+
+    Returns
+    -------
+    ndarray, shape (n_samples, len(years))
+        H(year) in mm, relative to BASELINE_YEAR.
+    """
+    if anchor_year is None:
+        anchor_year = S1_ISMIP6_FIT_ANCHOR_YEAR
+    _s1_mean, _s1_cov = get_s1_quadratic()
+    draws = rng.multivariate_normal(_s1_mean, _s1_cov,
+                                     size=n_samples)
+    a, v, H0 = draws[:, 0], draws[:, 1], draws[:, 2]
+    tau = np.asarray(years, dtype=float) - BASELINE_YEAR
+    H_m = (0.5 * a[:, None] * tau[None, :] ** 2
+           + v[:, None] * tau[None, :] + H0[:, None])
+
+    extra_var_m2 = _s1_ismip6_extra_var_m2(years, anchor_year)  # shape (len(years),)
+    eta = rng.standard_normal(n_samples)  # ONE draw per sample -- smooth trajectories
+    H_m = H_m + eta[:, None] * np.sqrt(extra_var_m2)[None, :]
+
+    return H_m * M_TO_MM
+
+
+# S2_fast_wais near-term blend: same sigmoid window (T_CENTER, TAU_BLEND)
+# as component_forecast.ipynb's aggregate rate-space blend
+# (blend_rate_space below), reused here rather than refit so the paper
+# applies one blending rule everywhere instead of a second free parameter
+# pair to justify.
+WAIS_S2_BLEND_T_CENTER = 2035.0
+WAIS_S2_BLEND_TAU = 5.0
+
+
+# Physical upper limit on the WAIS contribution: ~3.3 m of global sea-level
+# equivalent is grounded on bedrock that deepens inland (Bamber et al., 2009,
+# as assessed in IPCC AR5 WG1 Ch. 13, Sec. 13.4.4.3, Church et al., 2013). Applied to S2 endpoints (as a truncation, with the
+# stated 5th/95th percentiles preserved) and to every trajectory year.
+WAIS_MAX_SLE_MM = 3300.0
+
+
+def _sample_log_skewnormal(n, low, high, alpha, rng, upper=None):
+    """Draw positive samples from a skew-normal in log-space.
+
+    Parameters
+    ----------
+    n : int
+        Number of samples.
+    low, high : float
+        5th and 95th percentiles of the target distribution (linear space).
+    alpha : float
+        Skew-normal shape parameter in log-space.  alpha=0 gives log-normal.
+    rng : numpy.random.Generator
+    upper : float or None
+        If given, the distribution is truncated at *upper* (same units as
+        *low*/*high*), and (xi, omega) are re-solved so that the 5th and
+        95th percentiles of the *truncated* distribution still equal *low*
+        and *high*. Samples above *upper* are redrawn, not clipped.
+
+    Returns
+    -------
+    samples : ndarray, shape (n,)
+        Positive samples in the same units as *low* and *high*.
+
+    Notes
+    -----
+    The skew-normal distribution SN(xi, omega, alpha) has CDF that depends
+    on all three parameters jointly.  We solve for (xi, omega) such that
+    quantile(0.05) = log(low) and quantile(0.95) = log(high) in log-space,
+    using scipy's ppf.  For alpha=0 this recovers the log-normal case.
+    """
+    from scipy.stats import skewnorm
+
+    log_lo = np.log(low)
+    log_hi = np.log(high)
+
+    # Quantiles of the standard skew-normal SN(0, 1, alpha)
+    q05_std = skewnorm.ppf(0.05, alpha)
+    q95_std = skewnorm.ppf(0.95, alpha)
+
+    # Solve for location (xi) and scale (omega) so that
+    #   xi + omega * q05_std = log(low)
+    #   xi + omega * q95_std = log(high)
+    omega = (log_hi - log_lo) / (q95_std - q05_std)
+    xi = log_lo - omega * q05_std
+
+    if upper is None:
+        # Draw in log-space, exponentiate
+        log_samples = skewnorm.rvs(alpha, loc=xi, scale=omega, size=n,
+                                   random_state=rng)
+        return np.exp(log_samples)
+
+    # Truncated case: solve F(low) = 0.05 F(U), F(high) = 0.95 F(U) for
+    # (xi, log omega), starting from the untruncated solution.
+    from scipy.optimize import fsolve
+    log_up = np.log(upper)
+
+    def _resid(p):
+        x, lw = p
+        cdf = lambda v: skewnorm.cdf(v, alpha, loc=x, scale=np.exp(lw))
+        F_up = cdf(log_up)
+        return [cdf(log_lo) - 0.05 * F_up, cdf(log_hi) - 0.95 * F_up]
+
+    sol, _, ier, msg = fsolve(_resid, [xi, np.log(omega)], full_output=True)
+    if ier != 1 or np.max(np.abs(_resid(sol))) > 1e-8:
+        raise RuntimeError(f'truncated skew-normal fit failed: {msg}')
+    xi, omega = sol[0], np.exp(sol[1])
+
+    out = np.empty(0)
+    while out.size < n:
+        draw = np.exp(skewnorm.rvs(alpha, loc=xi, scale=omega,
+                                   size=2 * (n - out.size) + 10,
+                                   random_state=rng))
+        out = np.concatenate([out, draw[draw <= upper]])
+    return out[:n]
+
+
+def sample_a4_wais(n_samples, rng, year=2100,
+                   anchor_year=None, anchor_value_mm=None,
+                   anchor_sigma_mm=None, obs_value_mm=None,
+                   obs_sigma_mm=None):
+    """Draw WAIS SLR samples (meters) from A4 scenario mixture at a given year.
+
+    Returns array of shape (n_samples,) in **meters**.
+
+    The projection is anchored to the IMBIE observed cumulative value at
+    ``anchor_year``.  Before the anchor year, samples are drawn from
+    N(obs_value, obs_sigma²) to reflect IMBIE measurement uncertainty.
+    After the anchor year, the *remaining* A4 contribution is distributed
+    with a power-law ramp, with the anchor uncertainty propagated:
+
+        H(t) = H_anchor_i + H_remaining_i · ((t − t_a) / (2100 − t_a))^β
+
+    where H_anchor_i ~ N(anchor_value, anchor_sigma²) and
+    H_remaining_i = H_2100 − H_anchor_i.
+
+    Parameters
+    ----------
+    n_samples : int
+    rng : numpy.random.Generator
+    year : float
+    anchor_year : float or None
+        Year at which the projection is anchored to observations.  If None,
+        uses ``WAIS_ONSET_YEAR`` from config (default 2010).
+    anchor_value_mm : float or None
+        IMBIE observed cumulative WAIS SLR (mm, relative to BASELINE_YEAR)
+        at ``anchor_year``.  If None, defaults to 0.0.
+    anchor_sigma_mm : float or None
+        IMBIE 1-sigma uncertainty (mm) at ``anchor_year``.  If None,
+        defaults to 0.0 (deterministic anchor).
+    obs_value_mm : float or None
+        IMBIE observed cumulative (mm) at ``year``, used for pre-anchor
+        years.  If None, uses ``anchor_value_mm``.
+    obs_sigma_mm : float or None
+        IMBIE 1-sigma uncertainty (mm) at ``year``, used for pre-anchor
+        years.  If None, defaults to 0.0.
+    """
+    # Ensure the S1 fit is installed before any scenario dispatch: the S2
+    # branch reads A4_SCENARIOS['S2_fast_wais']['low_mm'], which
+    # set_s1_quadratic() derives, and an S2-only weighting would otherwise
+    # never reach the S1 branch that would have triggered the load.
+    get_s1_quadratic()
+    if anchor_year is None:
+        anchor_year = WAIS_ONSET_YEAR
+    if anchor_value_mm is None:
+        anchor_value_mm = 0.0
+    if anchor_sigma_mm is None:
+        anchor_sigma_mm = 0.0
+
+    # Before anchor year: return IMBIE value with measurement uncertainty
+    if year <= anchor_year:
+        val = obs_value_mm if obs_value_mm is not None else anchor_value_mm
+        sig = obs_sigma_mm if obs_sigma_mm is not None else 0.0
+        if sig > 0:
+            return rng.normal(val, sig, size=n_samples) / M_TO_MM
+        return np.full(n_samples, val / M_TO_MM)
+
+    t_norm = (year - anchor_year) / (2100 - anchor_year)
+
+    # Per-sample anchor with IMBIE uncertainty
+    if anchor_sigma_mm > 0:
+        anchor_draws = rng.normal(anchor_value_mm, anchor_sigma_mm,
+                                  size=n_samples)
+    else:
+        anchor_draws = np.full(n_samples, anchor_value_mm)
+
+    samples = np.zeros(n_samples)
+    scenario_names = list(A4_SCENARIOS.keys())
+    probs = np.array([A4_SCENARIOS[s]['P'] for s in scenario_names])
+
+    scenario_idx = rng.choice(len(scenario_names), size=n_samples, p=probs)
+
+    # Spawn independent child RNGs per scenario
+    child_rngs = rng.spawn(len(scenario_names))
+
+    for i, sname in enumerate(scenario_names):
+        mask = scenario_idx == i
+        n_s = mask.sum()
+        if n_s == 0:
+            continue
+        crng = child_rngs[i]
+
+        if sname == 'S1_status_quo':
+            # Direct posterior sampling (quadratic-in-time fit), spliced
+            # onto the shared anchor -- see A4_SCENARIOS comment block.
+            # No power-law ramp. anchor_year is passed through so the
+            # ISMIP6 extra-variance term (see S1_ISMIP6_STD_COEFFS) is
+            # exactly zero at this function's own splice anchor, not
+            # S1_ISMIP6_FIT_ANCHOR_YEAR's default.
+            h_model = _sample_s1_quadratic_mm(n_s, crng, [anchor_year, year],
+                                               anchor_year=anchor_year)
+            anchor_i = anchor_draws[mask]
+            samples[mask] = anchor_i + (h_model[:, 1] - h_model[:, 0])
+            continue
+
+        s = A4_SCENARIOS[sname]
+
+        # ── Endpoint: draw H_2100 from the truncated skew-normal ──
+        base = _sample_log_skewnormal(
+            n_s, s['low_mm'], s['high_mm'], s['alpha'], crng,
+            upper=WAIS_MAX_SLE_MM,
+        )
+
+        # Trajectory exponent
+        if s['beta_scale'] > 0:
+            beta = crng.lognormal(s['beta_loc'], s['beta_scale'], size=n_s)
+        else:
+            beta = np.ones(n_s)
+
+        # Remaining contribution after anchor: H_2100 - H_anchor_i
+        anchor_i = anchor_draws[mask]
+        h_remaining = np.maximum(base - anchor_i, 0.0)
+        samples[mask] = anchor_i + h_remaining * (t_norm ** beta)
+
+    # WAIS cannot supply more than its marine-based ice (WAIS_MAX_SLE_MM).
+    return np.minimum(samples, WAIS_MAX_SLE_MM) / M_TO_MM  # meters
+
+
+def sample_a4_wais_endpoint(n_samples, rng,
+                             scenario_overrides=None, anchor_year=None,
+                             anchor_value_mm=None):
+    """Draw WAIS SLR endpoint samples (meters) at 2100 from the A4 mixture.
+
+    This is a lightweight wrapper for sensitivity analyses that need to
+    perturb scenario parameters without trajectory or anchor logic.
+    S2_fast_wais's endpoint is sampled from the log-skew-normal, truncated
+    at WAIS_MAX_SLE_MM. S1_status_quo is instead sampled directly from its
+    quadratic-in-time posterior (see get_s1_quadratic() and
+    _sample_s1_quadratic_mm above) -- see the A4_SCENARIOS comment block
+    for why.
+
+    Parameters
+    ----------
+    n_samples : int
+    rng : numpy.random.Generator
+    scenario_overrides : dict or None
+        Per-scenario parameter overrides.  Keys are scenario names
+        (e.g. 'S2_fast_wais'); values are dicts that can override any of
+        'P', 'low_mm', 'high_mm', 'alpha'.  Missing keys use defaults
+        from A4_SCENARIOS.  You can also pass a top-level key 'weights'
+        mapping scenario names to new probabilities (must sum to 1).
+        S1_status_quo has no 'low_mm'/'high_mm'/'alpha' to override --
+        its distribution is fixed by the installed S1 quadratic fit.
+    anchor_year, anchor_value_mm : float or None
+        Optional splice for S1, as in ``sample_a4_wais_trajectories``: the
+        S1 endpoint becomes anchor_value_mm + (H(2100) - H(anchor_year)),
+        and the ISMIP6 extra-variance term is zero at ``anchor_year``.
+        When None (the default), S1 is the unspliced quadratic (H0 = 0)
+        with the S1_ISMIP6_FIT_ANCHOR_YEAR default. Passing the
+        trajectories' splice anchor and observed level makes the two
+        samplers agree (the difference is about 0.4 mm).
+
+    Returns
+    -------
+    samples_m : ndarray, shape (n_samples,)
+        Endpoint samples in meters at 2100.
+    """
+    # Ensure the S1 fit is installed before any scenario dispatch: the S2
+    # branch reads A4_SCENARIOS['S2_fast_wais']['low_mm'], which
+    # set_s1_quadratic() derives, and an S2-only weighting would otherwise
+    # never reach the S1 branch that would have triggered the load.
+    get_s1_quadratic()
+    overrides = scenario_overrides or {}
+
+    scenario_names = list(A4_SCENARIOS.keys())
+
+    # Build effective parameters per scenario
+    eff = {}
+    for sname in scenario_names:
+        base = dict(A4_SCENARIOS[sname])
+        if sname in overrides:
+            base.update(overrides[sname])
+        eff[sname] = base
+
+    # Allow top-level weight override
+    if 'weights' in overrides:
+        for sname, w in overrides['weights'].items():
+            eff[sname]['P'] = w
+
+    probs = np.array([eff[s]['P'] for s in scenario_names])
+    probs = probs / probs.sum()  # ensure normalization
+
+    scenario_idx = rng.choice(len(scenario_names), size=n_samples, p=probs)
+
+    # Spawn independent child RNGs per scenario so that changing n_s in
+    # one scenario (e.g. via weight perturbation) does not shift the RNG
+    # state for subsequent scenarios.
+    child_rngs = rng.spawn(len(scenario_names))
+
+    samples = np.zeros(n_samples)
+    for i, sname in enumerate(scenario_names):
+        mask = scenario_idx == i
+        n_s = mask.sum()
+        if n_s == 0:
+            continue
+        crng = child_rngs[i]
+
+        if sname == 'S1_status_quo':
+            if anchor_year is None:
+                # Unspliced: anchor_year is left at its default
+                # (S1_ISMIP6_FIT_ANCHOR_YEAR) -- see
+                # _sample_s1_quadratic_mm's docstring.
+                samples[mask] = _sample_s1_quadratic_mm(n_s, crng, [2100.0])[:, 0]
+            else:
+                h_model = _sample_s1_quadratic_mm(n_s, crng,
+                                                   [anchor_year, 2100.0],
+                                                   anchor_year=anchor_year)
+                h_anchor = 0.0 if anchor_value_mm is None else anchor_value_mm
+                samples[mask] = h_anchor + (h_model[:, 1] - h_model[:, 0])
+            continue
+
+        s = eff[sname]
+        samples[mask] = _sample_log_skewnormal(
+            n_s, s['low_mm'], s['high_mm'], s['alpha'], crng,
+            upper=WAIS_MAX_SLE_MM,
+        )
+
+    # WAIS cannot supply more than its marine-based ice (WAIS_MAX_SLE_MM).
+    return np.minimum(samples, WAIS_MAX_SLE_MM) / M_TO_MM  # meters
+
+
+def sample_a4_wais_trajectories(n_samples, rng, years,
+                                 anchor_year=None, anchor_value_mm=None,
+                                 anchor_sigma_mm=None,
+                                 obs_years=None, obs_values_mm=None,
+                                 obs_sigmas_mm=None):
+    """Draw coherent WAIS SLR trajectories from the A4 scenario mixture.
+
+    Unlike ``sample_a4_wais`` (which draws independently at each year),
+    this function draws scenario assignments, endpoint values, and
+    trajectory exponents **once** per sample, then evaluates
+    the power-law ramp deterministically across all years.  This ensures
+    that individual trajectories are smooth and internally consistent.
+
+    S1_status_quo is the exception: it has no MISI by construction, so its
+    post-anchor shape is not the power-law ramp but the (a, v, H0)
+    quadratic-in-time posterior drawn once per S1 sample (see
+    get_s1_quadratic() above), spliced onto the same shared
+    ``anchor_draws`` every scenario uses so trajectories stay continuous
+    at ``anchor_year``: samples_mm = anchor_draws + (H_model(t) -
+    H_model(anchor_year)).
+
+    Parameters
+    ----------
+    n_samples : int
+    rng : numpy.random.Generator
+    years : array-like
+        Projection years (e.g. 1950–2150).
+    anchor_year : float or None
+        Defaults to WAIS_ONSET_YEAR.
+    anchor_value_mm : float or None
+        IMBIE cumulative WAIS SLR (mm) at anchor_year.
+    anchor_sigma_mm : float or None
+        IMBIE 1-sigma (mm) at anchor_year.
+    obs_years, obs_values_mm, obs_sigmas_mm : array-like or None
+        IMBIE time series for pre-anchor interpolation (years, mm, mm).
+        If provided, pre-anchor samples are obs(t) plus correlated
+        observation errors (independent increments of variance
+        |sigma_j^2 - sigma_{j-1}^2|, cumulated; see cumulative_error_paths),
+        conditioned to end at each member's anchor draw.
+
+    Returns
+    -------
+    samples_m : ndarray, shape (n_samples, len(years))
+        Trajectories in meters relative to BASELINE_YEAR.
+    params : dict
+        Per-sample drawn parameters: 'scenario_idx', 'h2100_mm',
+        'beta', 'anchor_mm'.
+    """
+    # Ensure the S1 fit is installed before any scenario dispatch: the S2
+    # branch reads A4_SCENARIOS['S2_fast_wais']['low_mm'], which
+    # set_s1_quadratic() derives, and an S2-only weighting would otherwise
+    # never reach the S1 branch that would have triggered the load.
+    get_s1_quadratic()
+    from scipy.interpolate import interp1d
+
+    years = np.asarray(years, dtype=float)
+    n_years = len(years)
+
+    if anchor_year is None:
+        anchor_year = WAIS_ONSET_YEAR
+    if anchor_value_mm is None:
+        anchor_value_mm = 0.0
+    if anchor_sigma_mm is None:
+        anchor_sigma_mm = 0.0
+
+    # ── Build obs interpolators for pre-anchor years ──
+    if obs_years is not None and obs_values_mm is not None:
+        obs_interp = interp1d(obs_years, obs_values_mm,
+                              kind='linear', bounds_error=False, fill_value=0.0)
+    else:
+        obs_interp = lambda t: anchor_value_mm
+
+    # ── Draw all per-sample parameters once ──
+    scenario_names = list(A4_SCENARIOS.keys())
+    probs = np.array([A4_SCENARIOS[s]['P'] for s in scenario_names])
+    scenario_idx = rng.choice(len(scenario_names), size=n_samples, p=probs)
+
+    # Per-sample anchor with IMBIE uncertainty
+    if anchor_sigma_mm > 0:
+        anchor_draws = rng.normal(anchor_value_mm, anchor_sigma_mm,
+                                  size=n_samples)
+    else:
+        anchor_draws = np.full(n_samples, anchor_value_mm)
+
+    # Correlated observation errors for the pre-anchor IMBIE record. The
+    # record is cumulative, so its errors are drawn as independent annual
+    # increments and cumulated (cumulative_error_paths), zero where the
+    # record is rebased (smallest sigma), then conditioned so each path ends
+    # at that member's anchor draw (random-walk bridge, weights from the
+    # accumulated variance). The errors come from a separate generator, not
+    # from rng.
+    obs_err = None
+    if (obs_years is not None and obs_values_mm is not None
+            and obs_sigmas_mm is not None and np.any(np.asarray(obs_sigmas_mm) > 0)):
+        _oy = np.asarray(obs_years, dtype=float)
+        _os = np.asarray(obs_sigmas_mm, dtype=float)
+        _ref = _oy[int(np.argmin(_os))]
+        _paths = cumulative_error_paths(_oy, _os, n_samples,
+                                        np.random.default_rng(20261014), _ref)
+        _v = np.clip(_os**2 - _os.min()**2, 0.0, None)
+        _v_end = float(np.interp(anchor_year, _oy, _v))
+        _w = np.where(_oy >= _ref, _v / _v_end, 0.0) if _v_end > 0 else np.zeros_like(_v)
+        _p_end = np.array([np.interp(anchor_year, _oy, _paths[k])
+                           for k in range(n_samples)])
+        _target = anchor_draws - float(obs_interp(anchor_year))
+        obs_err = _paths + (_target - _p_end)[:, None] * _w[None, :]
+
+    h2100 = np.zeros(n_samples)
+    beta_arr = np.zeros(n_samples)
+
+    # S1_status_quo's post-anchor curve, precomputed per-sample across
+    # `years` (plus anchor_year, to splice) from its own quadratic
+    # posterior draw. Populated only for S1-masked rows below; unused
+    # elsewhere.
+    s1_idx = scenario_names.index('S1_status_quo')
+    s1_anchor_model_mm = np.zeros(n_samples)
+    s1_curve_mm = np.zeros((n_samples, n_years))
+
+    # Spawn independent child RNGs per scenario
+    child_rngs = rng.spawn(len(scenario_names))
+
+    for i, sname in enumerate(scenario_names):
+        mask = scenario_idx == i
+        n_s = mask.sum()
+        if n_s == 0:
+            continue
+        crng = child_rngs[i]
+
+        if sname == 'S1_status_quo':
+            eval_years = np.concatenate([[anchor_year, 2100.0], years])
+            # anchor_year passed through so the ISMIP6 extra-variance term
+            # (S1_ISMIP6_STD_COEFFS) is exactly zero at this trajectory's
+            # own splice anchor -- see _sample_s1_quadratic_mm docstring.
+            h_model = _sample_s1_quadratic_mm(n_s, crng, eval_years,
+                                               anchor_year=anchor_year)
+            s1_anchor_model_mm[mask] = h_model[:, 0]
+            h2100[mask] = anchor_draws[mask] + (h_model[:, 1] - h_model[:, 0])
+            s1_curve_mm[mask, :] = h_model[:, 2:]
+            continue
+
+        s = A4_SCENARIOS[sname]
+
+        # Endpoint: draw H_2100 from the truncated skew-normal
+        h2100[mask] = _sample_log_skewnormal(
+            n_s, s['low_mm'], s['high_mm'], s['alpha'], crng,
+            upper=WAIS_MAX_SLE_MM,
+        )
+
+        # Trajectory exponent
+        if s['beta_scale'] > 0:
+            beta_arr[mask] = crng.lognormal(s['beta_loc'], s['beta_scale'],
+                                            size=n_s)
+        else:
+            beta_arr[mask] = 1.0
+
+    # ── Compute trajectories across all years ──
+    samples_mm = np.zeros((n_samples, n_years))
+    t_denom = 2100.0 - anchor_year
+
+    for j, yr in enumerate(years):
+        if yr < (obs_years[0] if obs_years is not None else anchor_year):
+            # Before observations: filled below with the first observed
+            # level (zero rate before the record begins)
+            continue
+        elif yr <= anchor_year:
+            # Pre-anchor: IMBIE observation with correlated measurement
+            # error (obs_err above).
+            val = float(obs_interp(yr))
+            if obs_err is not None:
+                samples_mm[:, j] = val + np.array(
+                    [np.interp(yr, obs_years, obs_err[k]) for k in range(n_samples)])
+            else:
+                samples_mm[:, j] = val
+        else:
+            # Post-anchor: deterministic power-law ramp from drawn parameters
+            t_norm = (yr - anchor_year) / t_denom
+            h_remaining = np.maximum(h2100 - anchor_draws, 0.0)
+            samples_mm[:, j] = anchor_draws + h_remaining * (t_norm ** beta_arr)
+
+            # S1_status_quo: override with its own quadratic-in-time shape
+            # (spliced onto the shared anchor value) instead of the
+            # power-law ramp above, which does not apply to S1.
+            s1_mask = scenario_idx == s1_idx
+            samples_mm[s1_mask, j] = (anchor_draws[s1_mask]
+                                       + (s1_curve_mm[s1_mask, j]
+                                          - s1_anchor_model_mm[s1_mask]))
+
+    # Zero rate before the record: hold each member at its first observed
+    # level rather than at zero, which would put a step into the hindcast.
+    pre_obs = years < (obs_years[0] if obs_years is not None else anchor_year)
+    if pre_obs.any() and not pre_obs.all():
+        j_first = int(np.argmax(~pre_obs))
+        samples_mm[:, pre_obs] = samples_mm[:, [j_first]]
+
+    # ── S2_fast_wais: rate-space blend of the power-law path with the
+    # IMBIE quadratic (naive "nothing new happens" continuation), so the
+    # near-term rate is data-anchored instead of forced to zero at the
+    # anchor year (the artifact of a pure power-law ramp with beta > 1).
+    # Uses the same blend_rate_space() machinery and sigmoid window as
+    # component_forecast.ipynb's aggregate blend, for one consistent
+    # blending rule across the paper. The blended path is then rescaled
+    # so H(2100) still equals the independently-drawn h2100 exactly: the
+    # blend reshapes *how* the trajectory gets to 2100, not the assessed
+    # endpoint distribution (the S2 skew-normal used by
+    # sample_a4_wais_endpoint(): low_mm = S1 median, high_mm = 1300 mm,
+    # truncated at WAIS_MAX_SLE_MM). S1 is
+    # untouched -- it already *is* the quadratic.
+    beta_eff_2035 = np.full(n_samples, np.nan)
+    beta_eff_2050 = np.full(n_samples, np.nan)
+    s2_idx = scenario_names.index('S2_fast_wais')
+    s2_mask = scenario_idx == s2_idx
+    n_s2 = int(s2_mask.sum())
+    fmask = years >= anchor_year
+
+    if n_s2 > 0 and np.any(fmask):
+        quad_rng = child_rngs[s2_idx].spawn(1)[0]
+        quad_draws = quad_rng.multivariate_normal(
+            *get_s1_quadratic(), size=n_s2)
+        a_q, v_q, H0_q = quad_draws[:, 0], quad_draws[:, 1], quad_draws[:, 2]
+        tau_q = years - BASELINE_YEAR
+        # quad_level_mm is passed only because blend_rate_space's signature
+        # takes it (sq_level_samples_rb); the function never reads it --
+        # only quad_rate_mm and the target's own level (target_mm) drive
+        # the blend. Kept for signature parity / potential future use.
+        quad_level_mm = (0.5 * a_q[:, None] * tau_q[None, :] ** 2
+                          + v_q[:, None] * tau_q[None, :]
+                          + H0_q[:, None]) * M_TO_MM
+        quad_rate_mm = (a_q[:, None] * tau_q[None, :] + v_q[:, None]) * M_TO_MM
+
+        target_mm = samples_mm[s2_mask, :]  # pre-blend: obs + power-law ramp
+        anchor_s2 = anchor_draws[s2_mask]
+        h2100_s2 = h2100[s2_mask]
+
+        blended_mm, f_years, _ = blend_rate_space(
+            years, target_mm, quad_rate_mm, quad_level_mm, years,
+            anchor_year, anchor_s2,
+            WAIS_S2_BLEND_T_CENTER, WAIS_S2_BLEND_TAU,
+        )
+
+        # Pin H(2100) exactly to h2100_s2 (see docstring above).
+        i2100 = int(np.argmin(np.abs(f_years - 2100.0)))
+        denom = blended_mm[:, i2100] - anchor_s2
+        safe = np.abs(denom) > 1e-9
+        scale = np.zeros(n_s2)
+        scale[safe] = (h2100_s2[safe] - anchor_s2[safe]) / denom[safe]
+        rescaled_mm = (anchor_s2[:, None]
+                        + (blended_mm - anchor_s2[:, None]) * scale[:, None])
+
+        samples_mm[np.ix_(s2_mask, fmask)] = rescaled_mm
+
+        # Effective exponent of the blended+rescaled path -- a reportable
+        # number for the text, replacing beta_ref=1.84 as "the" trajectory
+        # shape (beta_arr above is now only the shape of the pre-blend
+        # target, not the realized path). Evaluated at two points:
+        # WAIS_S2_BLEND_T_CENTER itself (2035, inside the transition --
+        # where the blend actually differs from the target) and 2050
+        # (past the transition, where it necessarily reconverges toward
+        # beta_arr and mainly serves as a sanity check on that
+        # reconvergence). Undefined (NaN) wherever the blended level at
+        # that year is at or below the anchor -- do not fill with a
+        # clipped/placeholder value, since log(remaining fraction) is only
+        # meaningful for a positive remaining fraction.
+        def _beta_eff_at(target_year):
+            i = int(np.argmin(np.abs(f_years - target_year)))
+            tau_i = (f_years[i] - anchor_year) / (2100.0 - anchor_year)
+            remain_frac = (rescaled_mm[:, i] - anchor_s2) / (h2100_s2 - anchor_s2)
+            out = np.full(n_s2, np.nan)
+            pos = remain_frac > 0
+            out[pos] = np.log(remain_frac[pos]) / np.log(tau_i)
+            return out
+
+        beta_eff_2035[s2_mask] = _beta_eff_at(WAIS_S2_BLEND_T_CENTER)
+        beta_eff_2050[s2_mask] = _beta_eff_at(2050.0)
+
+    params = {
+        'scenario_idx': scenario_idx,
+        'h2100_mm': h2100,
+        'beta': beta_arr,
+        'beta_eff_2035': beta_eff_2035,
+        'beta_eff_2050': beta_eff_2050,
+        'anchor_mm': anchor_draws,
+    }
+    # Cap every trajectory year at the marine-based WAIS volume: once that
+    # ice is gone the contribution levels off (applies after 2100 in S2).
+    samples_mm = np.minimum(samples_mm, WAIS_MAX_SLE_MM)
+    return samples_mm / M_TO_MM, params
+
+
+# =========================================================================
+# Glacier volume cap
+# =========================================================================
+
+def apply_glacier_volume_cap(samples, v_total=0.32):
+    """Cap cumulative glacier mass loss at the total glacier ice volume.
+
+    Glaciers are a finite reservoir (~0.32 m SLE from the Randolph Glacier
+    Inventory / Farinotti et al. 2019).  Under sustained warming, cumulative
+    mass loss cannot exceed this volume.  This function clamps each MC
+    sample so that cumulative loss never exceeds ``v_total``.
+
+    Parameters
+    ----------
+    samples : ndarray, shape (n_samples, n_times)
+        Cumulative glacier SLR contribution in meters (positive = SLR).
+        Values are expected to be relative to a baseline year where
+        cumulative loss is near zero.
+    v_total : float
+        Total glacier volume in meters SLE (default 0.32 m).
+
+    Returns
+    -------
+    ndarray, same shape as ``samples``
+        Capped samples. Each value above ``v_total`` is set to
+        ``v_total`` (an element-wise clamp). A trajectory that later fell
+        back below the cap would follow its uncapped values again; this does
+        not occur in the projections, whose glacier trajectories are
+        monotone (the rate is negative only for T below T_eq0, which the
+        SSP paths never reach).
+    """
+    capped = samples.copy()
+    capped[capped > v_total] = v_total
+    return capped
+
+
+# =========================================================================
+# Greenland joint-model projections
+# =========================================================================
+
+def project_greenland_joint_ensemble(
+    result_joint,
+    ocean_transfer,
+    proj_monthly_temps,
+    proj_monthly_times,
+    gr_temp_monthly,
+    gr_time_monthly,
+    T_ocean_monthly,
+    time_ocean_monthly,
+    projection_times,
+    baseline_year=2000.0,
+    n_samples=2000,
+    AA=2.58,
+    seed=None,
+):
+    """Project Greenland SLR from the joint SMB + discharge model.
+
+    Legacy: no pipeline caller. It projects the retired joint
+    SMB + discharge model with AA = 2.58 times GMST; component_greenland
+    uses the MAR emulator with a drift state and the analytic discharge
+    fit driven by Greenland regional temperature.
+
+    Uses separate SMB and discharge posteriors from ``result_joint``,
+    with ocean temperature projected via a surface-to-ocean transfer
+    function for the discharge ODE.
+
+    Parameters
+    ----------
+    result_joint : BayesianGreenlandJointResult
+        Joint model fit result.
+    ocean_transfer : dict
+        From ``fit_ocean_transfer_function``.
+    proj_monthly_temps : dict
+        ``{ssp_name: ndarray}`` — monthly GMST for each SSP.
+    proj_monthly_times : dict
+        ``{ssp_name: ndarray}`` — monthly decimal years.
+    gr_temp_monthly : ndarray
+        Historical monthly Greenland surface T (for design vectors).
+    gr_time_monthly : ndarray
+        Decimal years for Greenland T.
+    T_ocean_monthly : ndarray
+        Historical monthly ocean T (for ODE spin-up).
+    time_ocean_monthly : ndarray
+        Decimal years for ocean T.
+    projection_times : ndarray
+        Annual times at which to evaluate projections.
+    baseline_year : float
+    n_samples : int
+    AA : float
+        Arctic amplification factor (GMST → Greenland surface T).
+    seed : int or None
+
+    Returns
+    -------
+    dict
+        ``{ssp: {'samples': (n_samples, n_times), 'median': ...,
+        'p5': ..., 'p17': ..., 'p83': ..., 'p95': ...,
+        'smb_median': ..., 'dyn_median': ...}}``
+    """
+    from bayesian_models import build_level_design_vectors, solve_twolayer_ode
+
+    rng = np.random.default_rng(seed)
+
+    # Draw posterior indices
+    n_post = len(result_joint.a_smb_posterior)
+    mc_idx = rng.choice(n_post, size=n_samples, replace=n_samples > n_post)
+
+    # Extract posteriors at drawn indices
+    a_smb = result_joint.a_smb_posterior[mc_idx]
+    b_smb = result_joint.b_smb_posterior[mc_idx]
+    H0_smb = result_joint.H0_smb_posterior[mc_idx]
+    gamma_atm = result_joint.gamma_atm_posterior[mc_idx]
+    gamma_ocean = result_joint.gamma_ocean_posterior[mc_idx]
+    tau = result_joint.tau_posterior[mc_idx]
+    D0 = result_joint.D0_posterior[mc_idx]
+    H0_dyn = result_joint.H0_dyn_posterior[mc_idx]
+
+    # Transfer function draws (propagate parameter uncertainty)
+    alpha_draws = rng.normal(ocean_transfer['alpha'],
+                             ocean_transfer['alpha_se'], size=n_samples)
+    beta_draws = rng.normal(ocean_transfer['beta'],
+                            ocean_transfer['beta_se'], size=n_samples)
+
+    projections = {}
+
+    for ssp_name in proj_monthly_temps:
+        T_gmst_mon = proj_monthly_temps[ssp_name]
+        t_mon = proj_monthly_times[ssp_name]
+
+        # Build Greenland surface T = AA × GMST (monthly)
+        T_gr_proj = T_gmst_mon * AA
+
+        # Splice: historical Greenland T + projected Greenland T
+        ssp_start = t_mon[0]
+        hist_mask_gr = gr_time_monthly < ssp_start
+        # Limit historical to where we have data
+        gr_hist_t = gr_time_monthly[hist_mask_gr]
+        gr_hist_T = gr_temp_monthly[hist_mask_gr]
+
+        # For SSP period, use AA × GMST
+        ssp_mask = t_mon >= ssp_start
+        t_full_gr = np.concatenate([gr_hist_t, t_mon[ssp_mask]])
+        T_full_gr = np.concatenate([gr_hist_T, T_gr_proj[ssp_mask]])
+
+        # Build design vectors for Greenland surface T
+        dv = build_level_design_vectors(
+            temperature_monthly=T_full_gr,
+            time_monthly=t_full_gr,
+            obs_times=projection_times,
+        )
+        I2_proj = dv['I2_obs']
+        I1_proj = dv['I1_obs']
+        I0_proj = dv['I0_obs']
+
+        # Build projected ocean T: splice historical + transfer(AA × GMST)
+        # Historical ocean T for ODE spin-up
+        hist_mask_oc = time_ocean_monthly < ssp_start
+        oc_hist_t = time_ocean_monthly[hist_mask_oc]
+        oc_hist_T = T_ocean_monthly[hist_mask_oc]
+
+        # MC ensemble
+        ens_total = np.zeros((n_samples, len(projection_times)))
+        ens_smb = np.zeros((n_samples, len(projection_times)))
+        ens_dyn = np.zeros((n_samples, len(projection_times)))
+
+        for i in range(n_samples):
+            # SMB: H_smb = a·I2 + b·I1 + H0_smb
+            H_smb_i = a_smb[i] * I2_proj + b_smb[i] * I1_proj + H0_smb[i]
+
+            # Discharge: build per-draw ocean T using transfer function
+            T_ocean_proj_i = alpha_draws[i] * T_gr_proj[ssp_mask] + beta_draws[i]
+            t_full_oc = np.concatenate([oc_hist_t, t_mon[ssp_mask]])
+            T_full_oc = np.concatenate([oc_hist_T, T_ocean_proj_i])
+
+            # Solve ODE: dD_eff/dt = (T_ocean - D_eff) / tau
+            D_eff_i, _ = solve_twolayer_ode(T_full_oc, t_full_oc,
+                                             tau[i], np.inf)
+
+            # Cumulative discharge at projection times
+            # ∫D_eff dt via trapezoidal rule, then interpolate
+            dt = np.diff(t_full_oc)
+            D_eff_mid = 0.5 * (D_eff_i[:-1] + D_eff_i[1:])
+            cum_D = np.concatenate([[0], np.cumsum(D_eff_mid * dt)])
+            cum_D_proj = np.interp(projection_times, t_full_oc, cum_D)
+
+            # Also need I1 for gamma_atm (atmospheric T sensitivity of discharge)
+            H_dyn_i = (gamma_atm[i] * I1_proj
+                       + gamma_ocean[i] * cum_D_proj
+                       + D0[i] * I0_proj + H0_dyn[i])
+
+            H_total_i = H_smb_i + H_dyn_i
+
+            # Rebase to baseline_year
+            bl_idx = np.argmin(np.abs(projection_times - baseline_year))
+            ens_smb[i] = H_smb_i - H_smb_i[bl_idx]
+            ens_dyn[i] = H_dyn_i - H_dyn_i[bl_idx]
+            ens_total[i] = H_total_i - H_total_i[bl_idx]
+
+        projections[ssp_name] = {
+            'samples': ens_total,
+            'median': np.median(ens_total, axis=0),
+            'p5': np.percentile(ens_total, 5, axis=0),
+            'p17': np.percentile(ens_total, 17, axis=0),
+            'p83': np.percentile(ens_total, 83, axis=0),
+            'p95': np.percentile(ens_total, 95, axis=0),
+            'smb_median': np.median(ens_smb, axis=0),
+            'dyn_median': np.median(ens_dyn, axis=0),
+        }
+
+    return projections
+
+
+# =========================================================================
+# IPCC component readers
+# =========================================================================
+
+def read_ipcc_component_nc(conf_base, conf_level, ssp_code, component):
+    """Read IPCC AR6 confidence-level NetCDF for a single component.
+
+    Parameters
+    ----------
+    conf_base : str
+        Base directory for confidence output files.
+    conf_level : str
+        E.g. ``'medium_confidence'``.
+    ssp_code : str
+        E.g. ``'ssp245'``.
+    component : str
+        E.g. ``'oceandynamics'``, ``'glaciers'``, ``'GIS'``, ``'AIS'``,
+        ``'landwaterstorage'``, ``'total'``.
+
+    Returns
+    -------
+    dict or None
+        ``{'years': ndarray, 'quantiles': ndarray, 'slc': ndarray}``
+        where ``slc`` is in mm.  Returns ``None`` if file not found.
+    """
+    fname = f'{component}_{ssp_code}_{conf_level}_values.nc'
+    fpath = os.path.join(conf_base, conf_level, ssp_code, fname)
+    if not os.path.exists(fpath):
+        return None
+    ds = nc.Dataset(fpath, 'r')
+    data = {
+        'years': ds.variables['years'][:].data.copy(),
+        'quantiles': ds.variables['quantiles'][:].data.copy(),
+        'slc': np.squeeze(ds.variables['sea_level_change'][:].data.copy()),  # mm
+    }
+    ds.close()
+    return data
+
+
+def ipcc_extract(data, quantiles_target=(0.05, 0.5, 0.95)):
+    """Extract specific quantile lines from IPCC data.
+
+    Parameters
+    ----------
+    data : dict
+        As returned by ``read_ipcc_component_nc``.
+    quantiles_target : tuple of float
+        Target quantile values.
+
+    Returns
+    -------
+    dict
+        ``{'years': ndarray, 'q05': ndarray, 'q50': ndarray, 'q95': ndarray}``
+        with keys named ``q{int(qt*100):02d}``.
+    """
+    out = {'years': data['years']}
+    for qt in quantiles_target:
+        idx = np.argmin(np.abs(data['quantiles'] - qt))
+        out[f'q{int(qt * 100):02d}'] = data['slc'][idx]
+    return out
+
+
+def read_ipcc_workflow_samples(workflow_base, wf_id, ssp_code, fname, year=2100):
+    """Read raw Monte Carlo samples for a single IPCC AR6 FACTS workflow.
+
+    Unlike the confidence-level p-box files (``read_ipcc_component_nc``),
+    these ``full_sample_workflows`` files hold one constituent model's own
+    Monte Carlo ensemble (e.g. the ISMIP6 emulator or LARMIP-2 alone) and
+    so represent a genuine single-model distribution, not an envelope
+    across models.
+
+    Parameters
+    ----------
+    workflow_base : str
+        Base directory for ``full_sample_workflows``.
+    wf_id : str
+        FACTS workflow identifier, e.g. ``'wf_1e'`` (ISMIP6 emulator),
+        ``'wf_2e'`` (LARMIP-2), ``'wf_3e'`` (DeConto et al. 2021 MICI),
+        ``'wf_4'`` (Bamber et al. 2019 SEJ).
+    ssp_code : str
+        E.g. ``'ssp585'``.
+    fname : str
+        Workflow-specific filename, e.g.
+        ``'icesheets-dp20-icesheet-ssp585_AIS_globalsl.nc'``.
+    year : int
+        Target year to extract (nearest available year is used).
+
+    Returns
+    -------
+    ndarray or None
+        1-D array of samples in mm at the requested year. ``None`` if the
+        file is not found.
+    """
+    fpath = os.path.join(workflow_base, wf_id, ssp_code, fname)
+    if not os.path.exists(fpath):
+        return None
+    ds = nc.Dataset(fpath, 'r')
+    years = ds.variables['years'][:]
+    yr_idx = np.argmin(np.abs(years - year))
+    samples = np.array(ds.variables['sea_level_change'][:, yr_idx, 0], dtype=float)
+    ds.close()
+    return samples
+
+
+# =========================================================================
+# Terrestrial water storage (TWS)
+# =========================================================================
+
+IPCC_DIST_PATH = (Path(__file__).resolve().parent.parent
+                  / 'data' / 'processed' / 'ipcc_distributions.h5')
+
+
+def load_ipcc_tws_projection(ssp, proj_years, n_samples=N_SAMPLES,
+                             h5_path=IPCC_DIST_PATH):
+    """IPCC AR6 TWS ensemble on *proj_years* (meters).
+
+    The single source of the projected TWS ensemble, shared by
+    component_summation.ipynb and component_forecast.ipynb so both sum the
+    same members. Reads ``samples/landwaterstorage/{ssp}`` from
+    ipcc_distributions.h5 (precompute_ipcc_distributions.py): a normal fit
+    to the five AR6 quantiles (5, 17, 50, 83, 95) at each AR6 year, with
+    each member holding one quantile across all years. Member paths are
+    linearly interpolated to *proj_years*. Values are on the AR6
+    reference, which is zero at 2005 (and, by the interpolation, before
+    2005).
+
+    Raises KeyError if the SSP is not in the file, and ValueError if the
+    file holds a different number of members than *n_samples* (rerun
+    precompute_ipcc_distributions.py with ``--n-samples``).
+    """
+    import h5py
+    with h5py.File(h5_path, 'r') as f:
+        grp = f[f'samples/landwaterstorage/{ssp}']
+        ipcc_years = grp['years'][:]
+        raw_mm = grp['samples'][:]
+    if raw_mm.shape[0] != n_samples:
+        raise ValueError(
+            f'{h5_path} holds {raw_mm.shape[0]} TWS members, expected '
+            f'{n_samples}; rerun precompute_ipcc_distributions.py '
+            f'--n-samples {n_samples}')
+
+    samples_m = np.array([np.interp(proj_years, ipcc_years, raw_mm[k] / M_TO_MM)
+                          for k in range(n_samples)])
+    return {
+        'samples': samples_m,
+        'median': np.median(samples_m, axis=0),
+        'p5': np.percentile(samples_m, 5, axis=0),
+        'p17': np.percentile(samples_m, 17, axis=0),
+        'p83': np.percentile(samples_m, 83, axis=0),
+        'p95': np.percentile(samples_m, 95, axis=0),
+    }
+
+
+def cumulative_error_paths(years, sigma, n_samples, rng, anchor_year):
+    """Correlated error paths for a cumulative record, zero at *anchor_year*.
+
+    A published cumulative sigma is the uncertainty accumulated from the
+    record's own reference epoch, so adjacent values share nearly all of
+    their error. Treating it as a sum of independent annual increments,
+    the increment variance between consecutive values is
+    |sigma_j^2 - sigma_{j-1}^2| (the convention of
+    component_analysis.annualize_imbie). This draws those increments and
+    cumulates them, re-anchored so every path is zero at *anchor_year*.
+
+    Parameters
+    ----------
+    years : ndarray (T,)
+        Record times (increasing).
+    sigma : ndarray (T,)
+        Published 1-sigma of the cumulative record (same units as output).
+    n_samples : int
+    rng : numpy.random.Generator
+    anchor_year : float
+        Epoch at which the error is zero (the record is rebased there).
+
+    Returns
+    -------
+    ndarray (n_samples, T)
+        Error paths on *years*.
+    """
+    inc_sd = np.sqrt(np.abs(np.diff(sigma ** 2)))
+    inc = rng.normal(0.0, 1.0, (n_samples, len(inc_sd))) * inc_sd[None, :]
+    err = np.concatenate([np.zeros((n_samples, 1)), np.cumsum(inc, axis=1)],
+                         axis=1)
+    err_anchor = np.array([np.interp(anchor_year, years, err[k])
+                           for k in range(n_samples)])
+    return err - err_anchor[:, None]
+
+
+# =========================================================================
+# Projection statistics helpers
+# =========================================================================
+
+def get_our_stats(comp_projections, proj_years, ssp, component_key,
+                  year=2100, n_samples=N_SAMPLES):
+    """Get median [5, 95] in mm for a component at *year*.
+
+    Parameters
+    ----------
+    comp_projections : dict
+        ``{ssp: {component: {'samples': ndarray}}}``
+    proj_years : ndarray
+    ssp, component_key : str
+    year : int
+    n_samples : int
+
+    Returns
+    -------
+    tuple of (p5, median, p95) or None
+    """
+    idx_yr = np.argmin(np.abs(proj_years - year))
+    if component_key == 'AIS':
+        samples = np.zeros((n_samples, len(proj_years)))
+        for cname in ['EAIS', 'Peninsula', 'WAIS']:
+            if cname in comp_projections[ssp]:
+                samples += comp_projections[ssp][cname]['samples']
+        s = samples[:, idx_yr] * M_TO_MM
+    elif component_key in comp_projections[ssp]:
+        s = comp_projections[ssp][component_key]['samples'][:, idx_yr] * M_TO_MM
+    else:
+        return None
+    return np.percentile(s, 5), np.median(s), np.percentile(s, 95)
+
+
+def get_ipcc_stats(ipcc_components, ssp, ipcc_key, year=2100):
+    """Get median [5, 95] in mm from IPCC at *year*.
+
+    Parameters
+    ----------
+    ipcc_components : dict
+        ``{ssp: {component: data_dict}}``
+    ssp, ipcc_key : str
+    year : int
+
+    Returns
+    -------
+    tuple of (p5, median, p95) or None
+    """
+    if ssp not in ipcc_components or ipcc_key not in ipcc_components[ssp]:
+        return None
+    data = ipcc_components[ssp][ipcc_key]
+    yr_idx = np.argmin(np.abs(data['years'] - year))
+    if np.abs(data['years'][yr_idx] - year) > 5:
+        return None
+    q05_idx = np.argmin(np.abs(data['quantiles'] - 0.05))
+    q50_idx = np.argmin(np.abs(data['quantiles'] - 0.50))
+    q95_idx = np.argmin(np.abs(data['quantiles'] - 0.95))
+    return (data['slc'][q05_idx, yr_idx],
+            data['slc'][q50_idx, yr_idx],
+            data['slc'][q95_idx, yr_idx])
+
+
+# =========================================================================
+# JSON export
+# =========================================================================
+
+def safe_float(x):
+    """Convert numpy scalar to Python float, handling NaN."""
+    val = float(x)
+    return val if np.isfinite(val) else None
+
+
+def stats_dict(samples_mm):
+    """Compute summary statistics dict from samples in mm."""
+    return {
+        'median': safe_float(np.median(samples_mm)),
+        'p05': safe_float(np.percentile(samples_mm, 5)),
+        'p17': safe_float(np.percentile(samples_mm, 17)),
+        'p83': safe_float(np.percentile(samples_mm, 83)),
+        'p95': safe_float(np.percentile(samples_mm, 95)),
+        'mean': safe_float(np.mean(samples_mm)),
+        'std': safe_float(np.std(samples_mm)),
+    }
+
+
+def export_results_json(export_dict, filepath):
+    """Write results dictionary to JSON.
+
+    Parameters
+    ----------
+    export_dict : dict
+        Nested dictionary of results.
+    filepath : str
+        Output path.
+    """
+    with open(filepath, 'w') as f:
+        json.dump(export_dict, f, indent=2)
+    fsize = os.path.getsize(filepath) / 1024
+    print(f'Exported: {filepath}  ({fsize:.1f} KB)')
+    for section in export_dict:
+        content = export_dict[section]
+        if isinstance(content, dict):
+            print(f'  {section}: {len(content)} entries')
+        else:
+            print(f'  {section}: {type(content).__name__}')
+
+
+# =========================================================================
+# ISMIP6 regional readers
+# =========================================================================
+
+OCEAN_AREA_M2 = 3.625e14  # standard ocean surface area (m²)
+
+# ISMIP6 Antarctica core experiments (Seroussi et al. 2020, Table 1). All are
+# forced by CMIP5 AOGCMs under RCP2.6 or RCP8.5; none is an SSP scenario.
+# melt: ocean-melt parameterization ('open' or 'standard'); sensitivity: gamma0
+# percentile of the standard parameterization ('PIGL' = Pine Island calibration);
+# collapse: ice-shelf collapse imposed.
+ISMIP6_EXPERIMENTS = {
+    'exp01': dict(aogcm='NorESM1-M', scenario='RCP8.5', melt='open', sensitivity='medium', collapse=False),
+    'exp02': dict(aogcm='MIROC-ESM-CHEM', scenario='RCP8.5', melt='open', sensitivity='medium', collapse=False),
+    'exp03': dict(aogcm='NorESM1-M', scenario='RCP2.6', melt='open', sensitivity='medium', collapse=False),
+    'exp04': dict(aogcm='CCSM4', scenario='RCP8.5', melt='open', sensitivity='medium', collapse=False),
+    'exp05': dict(aogcm='NorESM1-M', scenario='RCP8.5', melt='standard', sensitivity='medium', collapse=False),
+    'exp06': dict(aogcm='MIROC-ESM-CHEM', scenario='RCP8.5', melt='standard', sensitivity='medium', collapse=False),
+    'exp07': dict(aogcm='NorESM1-M', scenario='RCP2.6', melt='standard', sensitivity='medium', collapse=False),
+    'exp08': dict(aogcm='CCSM4', scenario='RCP8.5', melt='standard', sensitivity='medium', collapse=False),
+    'exp09': dict(aogcm='NorESM1-M', scenario='RCP8.5', melt='standard', sensitivity='high', collapse=False),
+    'exp10': dict(aogcm='NorESM1-M', scenario='RCP8.5', melt='standard', sensitivity='low', collapse=False),
+    'exp11': dict(aogcm='CCSM4', scenario='RCP8.5', melt='open', sensitivity='medium', collapse=True),
+    'exp12': dict(aogcm='CCSM4', scenario='RCP8.5', melt='standard', sensitivity='medium', collapse=True),
+    'exp13': dict(aogcm='NorESM1-M', scenario='RCP8.5', melt='standard', sensitivity='PIGL', collapse=False),
+}
+
+# Closest ISMIP6 analogs to our SSP projections: the standard-melt,
+# medium-sensitivity runs without ice-shelf collapse, grouped by forcing
+# scenario. ISMIP6 has no core experiments for intermediate scenarios, so
+# SSP2-4.5 and SSP3-7.0 have no analog.
+ISMIP6_SSP_ANALOG = {
+    'SSP1-2.6': ['exp07'],                    # RCP2.6
+    'SSP5-8.5': ['exp05', 'exp06', 'exp08'],  # RCP8.5
+}
+
+# Default experiment set for read_ismip6_regional: RCP8.5 runs spanning the
+# medium, high, low and PIGL melt sensitivities and the ice-shelf-collapse runs.
+ISMIP6_DEFAULT_EXPERIMENTS = ['exp05', 'exp06', 'exp09', 'exp10', 'exp11', 'exp12', 'exp13']
+
+
+def read_ismip6_regional(
+    ismip6_base,
+    region,
+    experiments=None,
+    use_ctrl_anomaly=True,
+):
+    """Read ISMIP6 Antarctica regional ivaf and convert to SLE.
+
+    Parameters
+    ----------
+    ismip6_base : str
+        Path to ``ComputedScalarsPaper/`` directory.
+    region : {1, 2, 3}
+        1 = West Antarctica, 2 = East Antarctica, 3 = Peninsula.
+    experiments : list of str or None
+        Experiment names to read (e.g. ``['exp05', 'exp13']``).
+        If None, reads ISMIP6_DEFAULT_EXPERIMENTS.
+    use_ctrl_anomaly : bool
+        If True (default), read the ``_minus_ctrl_proj_`` files
+        (anomaly from control). If False, read raw ivaf and subtract
+        the first time step.
+
+    Returns
+    -------
+    dict
+        ``{(group, model, exp): {'time': ndarray, 'sle_m': ndarray,
+        'scenario': str, 'label': str}}``
+        where ``sle_m`` is in meters (positive = sea level rise),
+        ``scenario`` is the CMIP5 forcing scenario (e.g. 'RCP8.5') and
+        ``label`` is '<AOGCM> <scenario>'.
+    """
+    if experiments is None:
+        experiments = list(ISMIP6_DEFAULT_EXPERIMENTS)
+
+    region_var = f'ivaf_region_{region}'
+    results = {}
+
+    for group_name in sorted(os.listdir(ismip6_base)):
+        group_path = os.path.join(ismip6_base, group_name)
+        if not os.path.isdir(group_path):
+            continue
+        for model_name in sorted(os.listdir(group_path)):
+            model_path = os.path.join(group_path, model_name)
+            if not os.path.isdir(model_path):
+                continue
+            for exp in experiments:
+                exp_path = os.path.join(model_path, exp)
+                if not os.path.isdir(exp_path):
+                    continue
+
+                if use_ctrl_anomaly:
+                    prefix = 'computed_ivaf_minus_ctrl_proj_AIS'
+                else:
+                    prefix = 'computed_ivaf_AIS'
+
+                fname = f'{prefix}_{group_name}_{model_name}_{exp}.nc'
+                fpath = os.path.join(exp_path, fname)
+                if not os.path.exists(fpath):
+                    continue
+
+                try:
+                    ds = nc.Dataset(fpath, 'r')
+                    time = ds.variables['time'][:].data.copy()
+                    ivaf_region = ds.variables[region_var][:].data.copy()
+                    rhoi = float(ds.variables['rhoi'][:])
+                    rhow = float(ds.variables['rhow'][:])
+                    ds.close()
+                except Exception:
+                    continue
+
+                # SLE = -delta_ivaf * rhoi / (ocean_area * rhow)
+                # For ctrl anomaly files, ivaf_region is already the delta
+                sle_m = -ivaf_region * rhoi / (OCEAN_AREA_M2 * rhow)
+
+                info = ISMIP6_EXPERIMENTS.get(exp, {})
+                scenario = info.get('scenario', exp)
+                results[(group_name, model_name, exp)] = {
+                    'time': time,
+                    'sle_m': sle_m,
+                    'scenario': scenario,
+                    'label': f"{info.get('aogcm', exp)} {scenario}",
+                }
+
+    return results
+
+
+def ismip6_ensemble_stats(ismip6_data, experiments=None, baseline_year=2015.0):
+    """Compute ensemble median and spread from ISMIP6 regional data.
+
+    Parameters
+    ----------
+    ismip6_data : dict
+        As returned by ``read_ismip6_regional``.
+    experiments : list of str or None
+        Filter to specific experiments.  If None, use all.
+    baseline_year : float
+        Rebase all trajectories to this year.
+
+    Returns
+    -------
+    dict
+        ``{'time': ndarray, 'median': ndarray, 'p5': ndarray,
+        'p95': ndarray, 'p17': ndarray, 'p83': ndarray,
+        'n_models': int, 'labels': list}``
+        All values in meters.
+    """
+    trajectories = []
+    labels = []
+    common_time = None
+
+    for key, val in ismip6_data.items():
+        if experiments is not None and key[2] not in experiments:
+            continue
+        t = val['time']
+        sle = val['sle_m']
+        if common_time is None:
+            common_time = t
+        # Interpolate onto common time grid
+        sle_interp = np.interp(common_time, t, sle)
+        # Rebase
+        bl_idx = np.argmin(np.abs(common_time - baseline_year))
+        sle_interp -= sle_interp[bl_idx]
+        trajectories.append(sle_interp)
+        labels.append(f'{key[0]}/{key[1]}')
+
+    if len(trajectories) == 0:
+        return None
+
+    ens = np.array(trajectories)
+    return {
+        'time': common_time,
+        'median': np.median(ens, axis=0),
+        'p5': np.percentile(ens, 5, axis=0),
+        'p17': np.percentile(ens, 17, axis=0),
+        'p83': np.percentile(ens, 83, axis=0),
+        'p95': np.percentile(ens, 95, axis=0),
+        'n_models': len(trajectories),
+        'labels': labels,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rate-space blending
+# ---------------------------------------------------------------------------
+
+def blend_rate_space(proj_years, comp_samples, sq_rate_samples, sq_level_samples_rb,
+                     sq_time, t_origin, h_origin, t_center, tau_blend):
+    """Blend quadratic and component-sum rates, integrate to level.
+
+    Parameters
+    ----------
+    proj_years : ndarray (T,)
+        Full projection time axis.
+    comp_samples : ndarray (N, T)
+        Component-sum level samples (meters, rel. to baseline).
+    sq_rate_samples : ndarray (N, T_sq)
+        Quadratic rate samples (m/yr) on sq_time grid.
+    sq_level_samples_rb : ndarray (N, T_sq)
+        Quadratic level samples (meters, rel. to baseline) on sq_time grid.
+    sq_time : ndarray (T_sq,)
+        Time axis for quadratic samples.
+    t_origin : float
+        Forecast origin (end of obs record). Need not lie on proj_years:
+        the level is integrated from t_origin to the first grid year.
+    h_origin : float or ndarray (N,)
+        Observed GMSL at t_origin (meters, rel. to baseline); an array
+        gives each sample its own origin level.
+    t_center : float
+        Center of sigmoid transition.
+    tau_blend : float
+        Width of sigmoid transition (years).
+
+    Returns
+    -------
+    forecast_samples : ndarray (N, T_forecast)
+        Blended level forecast (meters, rel. to baseline).
+    forecast_years : ndarray (T_forecast,)
+        Time axis for the forecast (grid years >= t_origin).
+    w_t : ndarray (T_forecast,)
+        Sigmoid weight at each forecast year (1 = pure quadratic).
+    """
+    n_samples = comp_samples.shape[0]
+
+    # Forecast grid: from origin onward (annual steps matching proj_years)
+    fmask = proj_years >= t_origin
+    f_years = proj_years[fmask]
+    n_t = len(f_years)
+
+    # Sigmoid weight: w=1 (quadratic) early, w=0 (component) late
+    w_t = 1.0 - expit((f_years - t_center) / tau_blend)
+
+    # Component-sum rate: central difference on annual grid
+    dt_proj = np.diff(proj_years)
+    comp_rate_all = np.diff(comp_samples, axis=1) / dt_proj[None, :]
+    # Rate at midpoints; shift to full-year grid via averaging neighbors
+    comp_rate_full = np.zeros_like(comp_samples)
+    comp_rate_full[:, 1:-1] = 0.5 * (comp_rate_all[:, :-1] + comp_rate_all[:, 1:])
+    comp_rate_full[:, 0] = comp_rate_all[:, 0]
+    comp_rate_full[:, -1] = comp_rate_all[:, -1]
+
+    # Restrict to forecast window
+    comp_rate_f = comp_rate_full[:, fmask]
+
+    # Interpolate quadratic rate onto forecast grid
+    sq_rate_f = np.zeros((n_samples, n_t))
+    for k in range(n_samples):
+        sq_rate_f[k] = np.interp(f_years, sq_time, sq_rate_samples[k])
+
+    # Blended rate (sample-by-sample)
+    blended_rate = w_t[None, :] * sq_rate_f + (1.0 - w_t[None, :]) * comp_rate_f
+
+    # Blended rate at t_origin itself, for the partial first step from
+    # t_origin to the first grid year (t_origin generally falls between
+    # grid years; assigning h_origin to f_years[0] would lag the forecast
+    # by f_years[0] - t_origin).
+    w_o = 1.0 - expit((t_origin - t_center) / tau_blend)
+    sq_rate_o = np.array([np.interp(t_origin, sq_time, sq_rate_samples[k])
+                          for k in range(n_samples)])
+    comp_rate_o = np.array([np.interp(t_origin, proj_years, comp_rate_full[k])
+                            for k in range(n_samples)])
+    blended_rate_o = w_o * sq_rate_o + (1.0 - w_o) * comp_rate_o
+
+    # Integrate from h_origin via cumulative trapezoidal rule
+    dt_f = np.diff(f_years)
+    forecast_samples = np.zeros((n_samples, n_t))
+    forecast_samples[:, 0] = (h_origin
+                              + 0.5 * (blended_rate_o + blended_rate[:, 0])
+                              * (f_years[0] - t_origin))
+    for j in range(1, n_t):
+        forecast_samples[:, j] = (forecast_samples[:, j - 1]
+                                  + 0.5 * (blended_rate[:, j - 1] + blended_rate[:, j])
+                                  * dt_f[j - 1])
+
+    return forecast_samples, f_years, w_t
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Uncharted glaciers (hindcast only)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Parkes & Marzeion (2018, Nature 563, 551-554): mean SLE contribution of
+# uncharted (missing + disappeared) glaciers, lower / upper bound, mm/yr.
+UNCHARTED_RATE_1901_1990 = (0.17, 0.53)
+UNCHARTED_RATE_1993_2010 = (0.08, 0.21)
+UNCHARTED_TAPER_START = 2000   # rate falls linearly from here ...
+UNCHARTED_END_YEAR = 2015      # ... to zero here (negligible by 2015, P&M 2018)
+
+
+def uncharted_glacier_hindcast(years, n_samples, baseline_year=2000.0, seed=None):
+    """Sea-level contribution of glaciers missing from modern inventories.
+
+    Parkes & Marzeion (2018) estimate that glaciers too small to be in the
+    Randolph Glacier Inventory ('missing') or that melted away after 1901
+    ('disappeared') added 16.7-48.0 mm SLE over 1901-2015, at mean rates of
+    0.17-0.53 mm/yr over 1901-1990 and 0.08-0.21 mm/yr over 1993-2010
+    (lower/upper bounds), largest early in the century. GlaMBIE and Zemp et
+    al. (2019) are built on inventoried glacier area, so the calibrated
+    glacier model does not contain this term before 2000.
+
+    Shape (our construction from those period means): for each bound the
+    rate falls linearly from 2*r1 - r2 in 1901 to r2 in 1990 (so its
+    1901-1990 mean is r1) and stays at r2 through 1999; it is zero before
+    1901. From 2000, the start of the GlaMBIE calibration record, the rate
+    falls linearly from r2 to zero in 2015, by when Parkes & Marzeion (2018)
+    find the contribution negligible (rate in year Y: r2 (2015 - Y) / 15).
+    This adds 8 r2 = 0.6-1.7 mm over 2000-2015. GlaMBIE's gravimetric and
+    altimetric inputs measure whole-region mass and may already include part
+    of it, so over 2000-2015 the term is an upper-end treatment. Each sample takes
+    a uniform position between the two bounds (they are bounds, not a
+    confidence interval) and is scaled by N(1, 0.09) for the 95% ranges of
+    the published totals (16.7 +/- 3.0 and 48.0 +/- 8.9 mm).
+
+    Parameters
+    ----------
+    years : array_like
+        Output years (annual grid; the level at Y.0, the start of year Y,
+        as in the calibrated glacier model on the same grid).
+    n_samples : int
+    baseline_year : float
+        Level is rebased to zero here (SLR-positive, so negative before).
+    seed : int, optional
+
+    Returns
+    -------
+    np.ndarray, shape (n_samples, len(years))
+        Cumulative contribution in meters SLE, rebased to ``baseline_year``.
+    """
+    years = np.asarray(years, dtype=float)
+    yy = np.arange(1900, max(int(years.max()), int(baseline_year)) + 1)
+
+    def profile(r1, r2):
+        r = np.zeros(len(yy))
+        early = (yy >= 1901) & (yy <= 1990)
+        r[early] = (2 * r1 - r2) + (r2 - (2 * r1 - r2)) * (yy[early] - 1901) / 89.0
+        r[(yy > 1990) & (yy < UNCHARTED_TAPER_START)] = r2
+        taper = (yy >= UNCHARTED_TAPER_START) & (yy < UNCHARTED_END_YEAR)
+        r[taper] = r2 * (UNCHARTED_END_YEAR - yy[taper]) / (UNCHARTED_END_YEAR - UNCHARTED_TAPER_START)
+        return r * 1e-3                                     # m/yr
+
+    lo = profile(UNCHARTED_RATE_1901_1990[0], UNCHARTED_RATE_1993_2010[0])
+    hi = profile(UNCHARTED_RATE_1901_1990[1], UNCHARTED_RATE_1993_2010[1])
+    rng = np.random.default_rng(seed)
+    u = rng.uniform(size=(n_samples, 1))
+    scale = rng.normal(1.0, 0.09, size=(n_samples, 1))
+    rate = (lo + u * (hi - lo)) * scale
+    level = np.cumsum(rate, axis=1) - rate        # level at the start of each year
+    level -= level[:, [int(np.argmin(np.abs(yy - baseline_year)))]]
+    idx = np.clip(np.searchsorted(yy, np.floor(years).astype(int)), 0, len(yy) - 1)
+    return level[:, idx]

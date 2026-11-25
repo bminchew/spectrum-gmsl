@@ -1,0 +1,411 @@
+"""Unit tests for the East Antarctic Ice Sheet (EAIS) component.
+
+Tests cover: IMBIE-3 data reader, SMB sensitivity parameters,
+SMB projection logic, HDF5 save/load roundtrip, and ISMIP6
+region mapping.
+
+Data source: IMBIE-3 (Otosaka et al. 2026), 1979-2023 (45 annual
+points, end-of-year labels 1980-2024) -- supersedes the IMBIE v2021
+record (1992-2020, 29 points) previously used here.
+"""
+
+import sys
+import os
+import tempfile
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'notebooks'))
+
+from component_io import save_eais, load_component, PROJ_YEARS
+from smb_projections import EAIS_SMB, project_smb_ensemble, GT_TO_M_SLE
+
+# Paths
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+RAW_DIR = os.path.join(PROJECT_ROOT, 'data', 'raw')
+H5_PATH = os.path.join(PROJECT_ROOT, 'data', 'processed', 'component_results.h5')
+IMBIE_EAIS_PATH = os.path.join(
+    RAW_DIR, 'ice_sheets', 'imbie2026',
+    'imbie3_east_antarctica_mm_partitioned.csv')
+ISMIP6_BASE = os.path.join(RAW_DIR, 'ice_sheets', 'ismip6', 'ComputedScalarsPaper')
+
+HAS_IMBIE_EAIS = os.path.exists(IMBIE_EAIS_PATH)
+HAS_H5 = os.path.exists(H5_PATH)
+HAS_ISMIP6 = os.path.exists(ISMIP6_BASE)
+
+from slr_forecast import M_TO_MM
+from slr_forecast.config import BASELINE_YEAR, N_SAMPLES
+# Ordered by warming, so the SSP-ordering test can step through it
+PROJ_SSPS = ['SSP1-1.9', 'SSP1-2.6', 'SSP2-4.5', 'SSP3-7.0', 'SSP5-8.5']
+
+
+# =========================================================================
+# IMBIE reader
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_IMBIE_EAIS, reason="IMBIE-3 EAIS CSV not found")
+class TestIMBIEEAISReader:
+    """Verify read_imbie3() + annualize_imbie() works on the IMBIE-3 EAIS CSV."""
+
+    @pytest.fixture(scope="class")
+    def eais_data(self):
+        from slr_data_readers import read_imbie3
+        from component_analysis import annualize_imbie
+        df = read_imbie3(IMBIE_EAIS_PATH, convert_to_meters=True)
+        years, H_rebase, sigma = annualize_imbie(df, baseline_year=BASELINE_YEAR)
+        return df, years, H_rebase, sigma
+
+    def test_columns_present(self, eais_data):
+        df = eais_data[0]
+        expected = {'decimal_year', 'cumulative_mass_balance',
+                    'cumulative_mass_balance_sigma'}
+        assert expected.issubset(set(df.columns))
+
+    def test_units_are_meters(self, eais_data):
+        df = eais_data[0]
+        max_abs = np.max(np.abs(df['cumulative_mass_balance'].values))
+        assert max_abs < 0.1, f"Max |cum| = {max_abs:.4f}, too large for meters"
+
+    def test_time_range(self, eais_data):
+        """IMBIE-3 spans 1979-2023 (vs. 1992-2020 for the superseded
+        IMBIE v2021 record); annualize_imbie() labels each year at its end."""
+        years = eais_data[1]
+        assert years[0] >= 1979 and years[0] <= 1981
+        assert years[-1] >= 2022
+
+    def test_n_years(self, eais_data):
+        """IMBIE-3 EAIS record: 45 annual points (1979-2023, end-of-year
+        labels 1980-2024), vs. 29 for the superseded IMBIE v2021 record
+        (1992-2020)."""
+        years = eais_data[1]
+        assert len(years) == 45
+
+    def test_annual_spacing(self, eais_data):
+        years = eais_data[1]
+        dt = np.diff(years)
+        assert np.allclose(dt, 1.0, atol=0.1)
+
+    def test_baseline_zero(self, eais_data):
+        years, H = eais_data[1], eais_data[2]
+        bl_idx = np.argmin(np.abs(years - BASELINE_YEAR))
+        assert abs(H[bl_idx]) < 1e-10
+
+    def test_near_mass_balance(self, eais_data):
+        """EAIS is near mass balance — cumulative should be small."""
+        H = eais_data[2]
+        H_mm = H[-1] * M_TO_MM
+        assert abs(H_mm) < 5, f"Final H = {H_mm:.2f} mm, too large for EAIS"
+
+    def test_sigma_positive(self, eais_data):
+        sigma = eais_data[3]
+        assert np.all(sigma >= 0)
+
+
+# =========================================================================
+# SMB sensitivity parameters
+# =========================================================================
+
+class TestEAISSMBParameters:
+    """Verify EAIS_SMB dataclass values match literature."""
+
+    def test_C_T_positive(self):
+        """EAIS C_T should be positive (warming → mass gain from snowfall)."""
+        assert EAIS_SMB.C_T > 0
+
+    def test_C_T_value(self):
+        assert EAIS_SMB.C_T == 60.0
+
+    def test_C_T_sigma_value(self):
+        assert EAIS_SMB.C_T_sigma == 20.0
+
+    def test_C_T2_zero(self):
+        """EAIS has no quadratic term."""
+        assert EAIS_SMB.C_T2 == 0.0
+        assert EAIS_SMB.C_T2_sigma == 0.0
+
+    def test_temperature_frame(self):
+        assert EAIS_SMB.temperature_frame == 'GMST'
+
+    def test_reference_not_empty(self):
+        assert len(EAIS_SMB.reference) > 0
+
+    def test_clausius_clapeyron_consistency(self):
+        """C_T ~ 5%/°C of ~1200 Gt/yr accumulation → ~60 Gt/yr/°C."""
+        cc_rate = 0.05  # 5%/°C
+        accumulation = 1200  # Gt/yr
+        expected = cc_rate * accumulation
+        assert abs(EAIS_SMB.C_T - expected) < 20, (
+            f"C_T={EAIS_SMB.C_T} vs CC estimate {expected}")
+
+
+# =========================================================================
+# SMB projection logic
+# =========================================================================
+
+class TestSMBIntegration:
+    """project_smb_ensemble integrates the rate with the trapezoid rule on
+    the time_proj nodes, so each step uses the mean of its end rates."""
+
+    def test_trapezoid_steps(self):
+        from smb_projections import SMBSensitivity
+        sens = SMBSensitivity(C_T=60.0, C_T_sigma=0.0)
+        t = np.arange(2000, 2101, dtype=float)
+        T = 0.03 * (t - 2000)
+        r = project_smb_ensemble(sens, {'x': T}, t, n_samples=3, seed=1,
+                                 baseline_year=2000.0)['x']
+        rate = -60.0 * T * GT_TO_M_SLE                    # m SLE/yr, SLR-positive
+        np.testing.assert_allclose(np.diff(r['samples'][0]),
+                                   0.5 * (rate[1:] + rate[:-1]), rtol=1e-12)
+        # exact for a rate linear in time: integral from 2000 to 2100
+        assert r['samples'][0, -1] == pytest.approx(-60.0 * GT_TO_M_SLE * 0.03 * 100**2 / 2,
+                                                    rel=1e-12)
+
+
+class TestSMBProjection:
+    """Verify project_smb_ensemble produces correct output structure."""
+
+    @pytest.fixture(scope="class")
+    def smb_result(self):
+        time_proj = np.arange(1950, 2151, dtype=float)
+        # Simple linear warming for testing
+        T_proj = {}
+        for ssp, rate in [('SSP1-2.6', 0.01), ('SSP5-8.5', 0.04)]:
+            T = np.zeros(len(time_proj))
+            T[time_proj >= 2005] = rate * (time_proj[time_proj >= 2005] - 2005)
+            T_proj[ssp] = T
+        return project_smb_ensemble(
+            sensitivity=EAIS_SMB,
+            T_proj=T_proj,
+            time_proj=time_proj,
+            T_baseline=0.0,
+            n_samples=500,
+            seed=42,
+        )
+
+    def test_returns_dict(self, smb_result):
+        assert isinstance(smb_result, dict)
+        assert 'SSP1-2.6' in smb_result
+        assert 'SSP5-8.5' in smb_result
+
+    def test_has_required_keys(self, smb_result):
+        proj = smb_result['SSP5-8.5']
+        for key in ('samples', 'median', 'p5', 'p95', 'p17', 'p83'):
+            assert key in proj, f"Missing key '{key}'"
+
+    def test_samples_shape(self, smb_result):
+        samples = smb_result['SSP5-8.5']['samples']
+        assert samples.shape == (500, 201)
+
+    def test_eais_negative_slr(self, smb_result):
+        """EAIS has positive C_T → warming → mass gain → negative SLR."""
+        idx_2100 = 150  # 2100 - 1950
+        for ssp in smb_result:
+            med = smb_result[ssp]['median'][idx_2100]
+            assert med < 0, (
+                f"{ssp} EAIS median at 2100 = {med*M_TO_MM:.1f} mm, expected < 0")
+
+    def test_higher_ssp_more_negative(self, smb_result):
+        """SSP5-8.5 should have more negative SLR (more mass gain)."""
+        idx_2100 = 150
+        med_low = smb_result['SSP1-2.6']['median'][idx_2100]
+        med_high = smb_result['SSP5-8.5']['median'][idx_2100]
+        assert med_high < med_low, (
+            f"SSP5-8.5 ({med_high*M_TO_MM:.1f}) should be more negative "
+            f"than SSP1-2.6 ({med_low*M_TO_MM:.1f})")
+
+    def test_percentile_ordering(self, smb_result):
+        proj = smb_result['SSP5-8.5']
+        idx = 150
+        assert proj['p5'][idx] <= proj['p17'][idx]
+        assert proj['p17'][idx] <= proj['median'][idx]
+        assert proj['median'][idx] <= proj['p83'][idx]
+        assert proj['p83'][idx] <= proj['p95'][idx]
+
+    def test_zero_at_baseline(self, smb_result):
+        """Projection should be near zero at baseline epoch."""
+        # baseline is where dT ≈ 0, which is ~2005 = index 55
+        idx_bl = 55
+        for ssp in smb_result:
+            med = smb_result[ssp]['median'][idx_bl]
+            assert abs(med) < 0.001, (
+                f"{ssp} at baseline = {med*M_TO_MM:.2f} mm, expected ~0")
+
+
+# =========================================================================
+# HDF5 roundtrip
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_H5, reason="component_results.h5 not found")
+class TestEAISSaveLoad:
+    """Verify save/load roundtrip for EAIS component."""
+
+    @pytest.fixture(scope="class")
+    def loaded(self):
+        return load_component('eais')
+
+    def test_metadata_model_type(self, loaded):
+        # component_eais/apeninsula pass 'linear_level_correlated';
+        # 'trend_only' is the legacy label in older result files.
+        assert loaded['metadata']['model_type'] in ('linear_level_correlated', 'trend_only')
+
+    def test_metadata_chi2_dof(self, loaded):
+        """The paper reports reduced chi-square for this fit, against the
+        correlated covariance of the cumulative record (independent annual
+        increments, no sigma_extra). Level-space R² is stored but not
+        checked: it is inflated on a cumulative record."""
+        chi2 = loaded['metadata']['chi2_dof']
+        assert 0.5 < chi2 < 1.5, f"chi2/dof = {chi2:.3f}, expected ~1"
+
+    def test_metadata_projection_method(self, loaded):
+        assert loaded['metadata']['projection_method'] == 'smb_literature'
+
+    def test_metadata_C_T(self, loaded):
+        assert loaded['metadata']['C_T'] == 60.0
+
+    def test_all_ssps_present(self, loaded):
+        for ssp in PROJ_SSPS:
+            assert ssp in loaded['projections'], f"Missing {ssp}"
+
+    def test_projection_keys(self, loaded):
+        proj = loaded['projections']['SSP2-4.5']
+        for key in ('samples', 'median', 'p5', 'p95', 'p17', 'p83'):
+            assert key in proj, f"Missing key '{key}' in SSP2-4.5"
+
+    def test_samples_shape(self, loaded):
+        samples = loaded['projections']['SSP2-4.5']['samples']
+        assert samples.shape[0] == N_SAMPLES
+        assert samples.shape[1] == len(loaded['proj_years'])
+
+    def test_percentile_ordering(self, loaded):
+        proj = loaded['projections']['SSP2-4.5']
+        idx = np.argmin(np.abs(loaded['proj_years'] - 2100))
+        assert proj['p5'][idx] <= proj['p17'][idx]
+        assert proj['p17'][idx] <= proj['median'][idx]
+        assert proj['median'][idx] <= proj['p83'][idx]
+        assert proj['p83'][idx] <= proj['p95'][idx]
+
+    def test_observations_present(self, loaded):
+        """HDF5-saved observations are IMBIE-3 (1979-2023, 45 annual
+        points), superseding the IMBIE v2021 record (1992-2020, 29 points)
+        previously saved here."""
+        obs = loaded['observations']
+        assert 'years' in obs
+        assert 'H_obs' in obs
+        assert 'sigma' in obs
+        assert len(obs['years']) == 45
+
+    def test_posteriors_present(self, loaded):
+        post = loaded['posteriors']
+        assert 'posterior_samples' in post
+        assert 'H0_posterior' in post
+
+
+# =========================================================================
+# Projection plausibility
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_H5, reason="component_results.h5 not found")
+class TestEAISProjections:
+    """Verify EAIS projections are physically plausible."""
+
+    @pytest.fixture(scope="class")
+    def loaded(self):
+        return load_component('eais')
+
+    def test_negative_slr_at_2100(self, loaded):
+        """EAIS should contribute negative SLR (mass gain) at 2100."""
+        idx = np.argmin(np.abs(loaded['proj_years'] - 2100))
+        for ssp in PROJ_SSPS:
+            med = loaded['projections'][ssp]['median'][idx]
+            assert med < 0, f"{ssp} median = {med*M_TO_MM:.1f} mm, expected < 0"
+
+    def test_range_at_2100(self, loaded):
+        """EAIS median at 2100 should be between -50 and 0 mm."""
+        idx = np.argmin(np.abs(loaded['proj_years'] - 2100))
+        for ssp in PROJ_SSPS:
+            med_mm = loaded['projections'][ssp]['median'][idx] * M_TO_MM
+            assert -50 < med_mm < 0, (
+                f"{ssp} median = {med_mm:.1f} mm, outside [-50, 0]")
+
+    def test_ssp_ordering(self, loaded):
+        """Higher SSP → more negative EAIS (more mass gain from snowfall)."""
+        idx = np.argmin(np.abs(loaded['proj_years'] - 2100))
+        medians = [loaded['projections'][ssp]['median'][idx]
+                    for ssp in PROJ_SSPS]
+        for i in range(len(medians) - 1):
+            assert medians[i] >= medians[i + 1] * 0.9, (
+                f"SSP ordering violated: {PROJ_SSPS[i]}={medians[i]*M_TO_MM:.1f}"
+                f" vs {PROJ_SSPS[i+1]}={medians[i+1]*M_TO_MM:.1f}")
+
+    def test_near_zero_at_baseline(self, loaded):
+        idx = np.argmin(np.abs(loaded['proj_years'] - BASELINE_YEAR))
+        for ssp in PROJ_SSPS:
+            med_mm = loaded['projections'][ssp]['median'][idx] * M_TO_MM
+            assert abs(med_mm) < 2.0, (
+                f"{ssp} at baseline = {med_mm:.2f} mm, expected ~0")
+
+    def test_uncertainty_grows(self, loaded):
+        """90% CI width should grow over time."""
+        proj = loaded['projections']['SSP5-8.5']
+        years = loaded['proj_years']
+        idx_2040 = np.argmin(np.abs(years - 2040))
+        idx_2100 = np.argmin(np.abs(years - 2100))
+        width_2040 = proj['p95'][idx_2040] - proj['p5'][idx_2040]
+        width_2100 = proj['p95'][idx_2100] - proj['p5'][idx_2100]
+        assert width_2100 > width_2040
+
+
+# =========================================================================
+# ISMIP6 reader
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_ISMIP6, reason="ISMIP6 data not found")
+class TestISMIP6EAIS:
+    """Verify ISMIP6 regional reader for EAIS (region=2)."""
+
+    def test_reads_eais(self):
+        from component_projections import read_ismip6_regional
+        data = read_ismip6_regional(ISMIP6_BASE, region=2)
+        assert len(data) > 0, "No ISMIP6 EAIS runs found"
+
+    def test_keys_are_tuples(self):
+        from component_projections import read_ismip6_regional
+        data = read_ismip6_regional(ISMIP6_BASE, region=2)
+        for key in data:
+            assert isinstance(key, tuple) and len(key) == 3
+
+    def test_sle_in_meters(self):
+        from component_projections import read_ismip6_regional
+        data = read_ismip6_regional(ISMIP6_BASE, region=2)
+        for key, val in data.items():
+            max_abs = np.max(np.abs(val['sle_m']))
+            assert max_abs < 0.5, (
+                f"Max |SLE| = {max_abs:.3f} m for {key}, too large for EAIS")
+            break
+
+
+class TestISMIP6ExperimentMetadata:
+    """ISMIP6 experiment metadata must match Seroussi et al. (2020), Table 1."""
+
+    def test_all_core_experiments_are_cmip5_rcp(self):
+        from component_projections import ISMIP6_EXPERIMENTS
+        assert set(ISMIP6_EXPERIMENTS) == {f'exp{i:02d}' for i in range(1, 14)}
+        for exp, info in ISMIP6_EXPERIMENTS.items():
+            assert info['scenario'] in ('RCP2.6', 'RCP8.5'), exp
+
+    def test_rcp26_experiments(self):
+        from component_projections import ISMIP6_EXPERIMENTS
+        rcp26 = sorted(e for e, i in ISMIP6_EXPERIMENTS.items() if i['scenario'] == 'RCP2.6')
+        assert rcp26 == ['exp03', 'exp07']
+
+    def test_ssp_analogs_are_standard_medium_no_collapse(self):
+        from component_projections import ISMIP6_EXPERIMENTS, ISMIP6_SSP_ANALOG
+        assert set(ISMIP6_SSP_ANALOG) == {'SSP1-2.6', 'SSP5-8.5'}
+        expected = {'SSP1-2.6': 'RCP2.6', 'SSP5-8.5': 'RCP8.5'}
+        for ssp, exps in ISMIP6_SSP_ANALOG.items():
+            for exp in exps:
+                info = ISMIP6_EXPERIMENTS[exp]
+                assert info['scenario'] == expected[ssp], (ssp, exp)
+                assert info['melt'] == 'standard' and info['sensitivity'] == 'medium'
+                assert not info['collapse']

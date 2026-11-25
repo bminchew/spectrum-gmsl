@@ -1,0 +1,175 @@
+"""Manuscript numbers for the slow-WAIS case at p(S1) = 90% against p(S1) = 100%.
+
+The slow-WAIS presentation case is a mixture: with probability p the total is
+drawn from the S1 (observed-trajectory) world and otherwise from the S2
+(accelerating) world. `blended_stable` supplies T | S1 for all 2000 samples and
+the S2 subset of `blended` supplies T | S2 for 1805, so every quantity below is
+a weighted statistic of those two branches. No resampling and no re-blending:
+both branches are already rate-space blended forecasts.
+
+Covers the quantities that appear in the main text at lines 387 (exceedance
+probabilities), 403 (interval widths), and 418 (the 5% exceedance design
+threshold and the impacts that follow from it). The variance and interval
+shares in the text come from variance_shares.py and manuscript_numbers.py.
+The "S2-branch var" column printed here is the share of the mixture variance
+carried by the S2 branch and its offset from S1, a check on a different basis
+that the text does not quote.
+
+Run from the repository root:  python scripts/slow_wais_p90_numbers.py
+"""
+
+import json
+import sys
+from pathlib import Path
+
+import h5py
+import numpy as np
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'notebooks'))
+sys.path.insert(0, str(ROOT / 'src'))
+
+M_TO_MM = 1000.0
+PREIND_M = None          # pre-industrial to 2000, from blended attrs (component_forecast)
+SSPS = ['SSP1-2.6', 'SSP2-4.5', 'SSP3-7.0']
+LABEL = {'SSP1-2.6': '1.8 C', 'SSP2-4.5': '2.7 C', 'SSP3-7.0': '3.6 C'}
+P_CASES = [0.9, 1.0]
+
+
+def weighted_quantile(v, w, q):
+    o = np.argsort(v)
+    v, w = np.asarray(v)[o], np.asarray(w)[o]
+    cdf = (np.cumsum(w) - 0.5 * w) / w.sum()
+    return np.interp(q, cdf, v)
+
+
+def main():
+    from impact_costs import ADAPT_COST_PER_M as ADAPT, damage_vec
+
+    with h5py.File(ROOT / 'data' / 'processed' / 'component_results.h5', 'r') as hf:
+        yrs = hf['blended/forecast_years'][:]
+        i = int(np.argmin(np.abs(yrs - 2100)))
+        idx = hf['blended/wais_scenario_idx'][:].astype(int)
+        global PREIND_M
+        PREIND_M = float(hf['blended'].attrs['preindustrial_to_baseline_m'])
+        T1 = {s: hf[f'blended_stable/{s}/samples'][:, i] for s in SSPS}
+        Tf = {s: hf[f'blended/{s}/samples'][:, i] for s in SSPS}
+
+    T2 = {s: Tf[s][idx == 1] for s in SSPS}
+    print(f'Branch sizes: S1 {len(T1[SSPS[0]])}, S2 {len(T2[SSPS[0]])}')
+    print(f'Pre-industrial to 2000 offset: {PREIND_M:.4f} m\n')
+
+    def branches(s, p):
+        v = np.concatenate([T1[s], T2[s]])
+        w = np.concatenate([np.full(T1[s].size, p / T1[s].size),
+                            np.full(T2[s].size, (1 - p) / T2[s].size)])
+        return v, w
+
+    out = {}
+
+    # ---- line 387: exceedance probabilities relative to pre-industrial -----
+    print('=== Exceedance probabilities at 2100, relative to pre-industrial ===')
+    print(f'{"p(S1)":>7}  {"scenario":<10}{"P>1 m":>8}{"P>1.5 m":>9}{"P>2 m":>8}')
+    for p in P_CASES:
+        for s in SSPS:
+            v, w = branches(s, p)
+            pi = v + PREIND_M
+            pr = [100 * w[pi > t].sum() / w.sum() for t in (1.0, 1.5, 2.0)]
+            out.setdefault(f'p{p:g}', {}).setdefault(s, {}).update(
+                P_exceed_1m=pr[0], P_exceed_1p5m=pr[1], P_exceed_2m=pr[2])
+            print(f'{p:7.1f}  {LABEL[s]:<10}{pr[0]:8.1f}{pr[1]:9.1f}{pr[2]:8.1f}')
+        print()
+
+    # ---- line 403: intervals and widths; S2-branch variance share (check) --
+    print('=== Interval and variance structure at 2100 (rel. 2000) ===')
+    print(f'{"p(S1)":>7}  {"scenario":<10}{"median cm":>11}{"90% CI cm":>20}'
+          f'{"width cm":>10}{"S2-branch var":>14}{"S1 width share":>16}')
+    for p in P_CASES:
+        for s in SSPS:
+            v, w = branches(s, p)
+            q = weighted_quantile(v, w, [0.05, 0.5, 0.95]) * 100  # cm
+            width = q[2] - q[0]
+            v1, v2 = T1[s].var(), T2[s].var()
+            m1, m2 = T1[s].mean(), T2[s].mean()
+            var = p * v1 + (1 - p) * v2 + p * (1 - p) * (m1 - m2) ** 2
+            s2_share = 100 * ((1 - p) * v2 + p * (1 - p) * (m1 - m2) ** 2) / var
+            w1 = (np.percentile(T1[s], 95) - np.percentile(T1[s], 5)) * 100
+            full = np.percentile(Tf[s], [5, 95]) * 100
+            out[f'p{p:g}'][s].update(
+                median_cm=q[1], p5_cm=q[0], p95_cm=q[2], width90_cm=width,
+                s2_variance_share_pct=s2_share,
+                s1_width_share_pct=100 * w1 / width,
+                narrower_than_full_factor=(full[1] - full[0]) / width)
+            print(f'{p:7.1f}  {LABEL[s]:<10}{q[1]:11.1f}'
+                  f'{f"[{q[0]:.1f}, {q[2]:.1f}]":>20}{width:10.1f}'
+                  f'{s2_share:14.1f}{100 * w1 / width:16.1f}')
+        print()
+
+    print('Slow-WAIS interval narrower than the full forecast by a factor of:')
+    for p in P_CASES:
+        f = [out[f'p{p:g}'][s]['narrower_than_full_factor'] for s in SSPS]
+        print(f'  p(S1)={p:.1f}: ' + ', '.join(f'{x:.1f}x' for x in f))
+
+    print('\n1.8 C to 3.6 C shift in the median:')
+    for p in P_CASES:
+        d = out[f'p{p:g}']['SSP3-7.0']['median_cm'] - out[f'p{p:g}']['SSP1-2.6']['median_cm']
+        print(f'  p(S1)={p:.1f}: {d:.1f} cm, US${ADAPT * d / 100:.0f}B/yr adaptation')
+
+    # ---- line 418: the 5% exceedance design threshold and its impacts ------
+    print('\n=== 5% exceedance threshold at 2.7 C (Fig. 2b stars) ===')
+    fast95 = np.percentile(Tf['SSP2-4.5'], 95)
+    for p in P_CASES:
+        v, w = branches('SSP2-4.5', p)
+        slow95 = float(weighted_quantile(v, w, [0.95])[0])
+        gap = fast95 - slow95
+        dadapt = ADAPT * gap
+        ddam = float(damage_vec(np.array([fast95]))[0]
+                     - damage_vec(np.array([slow95]))[0])
+        out[f'p{p:g}']['threshold_5pct'] = dict(
+            slow_95th_m_rel2000=slow95, fast_95th_m_rel2000=float(fast95),
+            gap_m=float(gap),
+            delta_adapt_B_per_yr=float(dadapt), delta_damage_B_per_yr=ddam)
+        print(f'  p(S1)={p:.1f}: slow {slow95:.3f} m, fast {fast95:.3f} m, '
+              f'gap {gap:.2f} m -> US${dadapt:.0f}B/yr '
+              f'adaptation, US${ddam / 1000:.1f}T/yr damages')
+
+    # Multiple of the observed rise over the past 125 years, as quoted at 436.
+    # Observed rise 1900 -> end of altimetry: each reconstruction's 1900-2000
+    # change plus the altimetry 2000 -> end change.  Projected rise over the
+    # next 75 years: the 95th percentile at 2100 (rel. 2000) minus the
+    # observed 2000 -> end change.
+    H5_OBS = ROOT / 'data' / 'processed' / 'slr_processed_data.h5'
+    fr = pd.read_hdf(H5_OBS, '/harmonized/df_frederikse_h')
+    dg = pd.read_hdf(H5_OBS, '/harmonized/df_dangendorf_h')
+    na = pd.read_hdf(H5_OBS, '/harmonized/df_nasa_gmsl_h')
+    nt, nv = na['decimal_year'].values, na['gmsl_smoothed'].values
+    alt_rise = float(np.interp(nt[-1], nt, nv) - np.interp(2000.0, nt, nv))
+    past = {}
+    for name, t, v in [('Frederikse', fr['year'].values.astype(float), fr['gmsl'].values),
+                       ('Dangendorf', dg['decimal_year'].values, dg['gmsl'].values)]:
+        past[name] = float(np.interp(2000.0, t, v) - np.interp(1900.0, t, v)) + alt_rise
+    print(f'\nObserved rise 1900-{nt[-1]:.0f}: ' + ', '.join(f'{k} {v:.3f} m' for k, v in past.items())
+          + f' (altimetry 2000-{nt[-1]:.0f}: {alt_rise:.3f} m)')
+    fast_next = float(fast95) - alt_rise
+    print(f'  fast WAIS (5% exceedance, 2.7 C): {fast_next:.3f} m over the next 75 yr = '
+          + ' to '.join(f'{fast_next / v:.1f}x' for v in sorted(past.values(), reverse=True)))
+    for p in P_CASES:
+        slow_next = out[f'p{p:g}']['threshold_5pct']['slow_95th_m_rel2000'] - alt_rise
+        print(f'  p(S1)={p:.1f}: slow WAIS {slow_next:.3f} m = '
+              + ' to '.join(f'{slow_next / v:.1f}x' for v in sorted(past.values(), reverse=True)))
+        out[f'p{p:g}']['threshold_5pct']['slow_multiple_of_past_rise'] = {
+            k: slow_next / v for k, v in past.items()}
+    for p in P_CASES:
+        out[f'p{p:g}']['threshold_5pct']['fast_multiple_of_past_rise'] = {
+            k: fast_next / v for k, v in past.items()}
+
+    dest = ROOT / 'data' / 'processed' / 'slow_wais_p90_numbers.json'
+    with open(dest, 'w') as f:
+        json.dump(dict(adapt_cost_per_m_B=ADAPT, preindustrial_offset_m=PREIND_M,
+                       cases=out), f, indent=1, default=float)
+    print(f'\nWrote {dest}')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,306 @@
+"""
+Precompute IPCC AR6 skew-normal distribution fits and MC samples.
+
+Fits a skew-normal distribution to the 5 key IPCC quantiles
+(5, 17, 50, 83, 95) at each (component, SSP, year) combination.
+This captures the genuine asymmetry (heavier upper tail) as a smooth,
+unimodal distribution without p-box median-seam artifacts.
+
+Outputs
+-------
+data/processed/ipcc_distributions.h5
+    ├── params/{component}/{ssp}
+    │     years, alpha, loc, scale    (skew-normal parameters)
+    ├── samples/{component}/{ssp}
+    │     samples  (N_SAMPLES, n_years) in mm
+    └── attrs: n_samples, seed, baseline_year, rebase_mm_total
+
+Only the "total" quantiles are shifted to BASELINE_YEAR, by the shared
+offset component_analysis.ar6_baseline_offset_m (15.0 mm; stored as
+attrs['rebase_mm_total']); the component quantiles stay on
+the AR6 reference (zero at the 2005 node).
+Each member of samples/ follows one quantile path across all years.
+
+Usage
+-----
+    python precompute_ipcc_distributions.py [--n-samples N] [--seed 777]
+
+The default --n-samples is slr_forecast.config.N_SAMPLES, the ensemble size
+of every component, so run_pipeline.sh (step `ipccdist`) regenerates this
+file at the size its readers expect. Both component_summation (TWS) and
+component_forecast read it, so the step must run before `summation`.
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import h5py
+import numpy as np
+from scipy.optimize import minimize
+from scipy.stats import skewnorm
+
+sys.path.insert(0, os.path.dirname(__file__))
+from component_projections import read_ipcc_component_nc, ipcc_extract
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+RAW_DIR = Path(__file__).resolve().parent.parent / "data" / "raw"
+PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
+CONF_BASE = RAW_DIR / "ipcc_ar6" / "slr" / "ar6" / "global" / "confidence_output_files"
+OUTPUT_PATH = PROCESSED_DIR / "ipcc_distributions.h5"
+
+try:
+    from slr_forecast.config import BASELINE_YEAR
+except ImportError:
+    BASELINE_YEAR = 2000.0
+from slr_forecast.config import N_SAMPLES   # must match the components; no fallback
+try:
+    from slr_forecast import M_TO_MM
+except ImportError:
+    M_TO_MM = 1000.0
+
+# IPCC AR6 projections are relative to the 1995-2014 mean. The *total*
+# quantiles are shifted to our baseline by the shared offset
+# (component_analysis.ar6_baseline_offset_m: NASA altimetry 1995-2014 mean
+# minus the satellite-era quadratic's level at BASELINE_YEAR, the
+# forecast's zero).
+# That offset is the total's own rebase and is applied to "total" only.
+# Adding it to every component would put each component, including TWS,
+# too high by that offset. The AR6 component files are zero at
+# their 2005 node and carry no per-component 2000-2005 change, so the
+# components stay on the AR6 reference; for TWS this matches the
+# hindcast, which holds TWS at zero before 2003.
+from component_analysis import ar6_baseline_offset_m
+_IPCC_REBASE_MM = ar6_baseline_offset_m(
+    str(PROCESSED_DIR / "slr_processed_data.h5"), BASELINE_YEAR) * M_TO_MM
+_IPCC_REBASE_COMPONENTS = {"total"}
+
+SSP_TO_CODE = {
+    "SSP1-2.6": "ssp126",
+    "SSP2-4.5": "ssp245",
+    "SSP3-7.0": "ssp370",
+    "SSP5-8.5": "ssp585",
+    "SSP1-1.9": "ssp119",
+}
+
+# Components whose AR6 quantiles are near-symmetric are fit with a plain
+# normal (median + spread) instead of a skew-normal. Stored with alpha = 0,
+# so downstream readers of params/{alpha,loc,scale} need no change.
+NORMAL_COMPONENTS = {"landwaterstorage"}
+
+# Components to precompute (IPCC NetCDF names)
+IPCC_COMPONENTS = [
+    "total",
+    "oceandynamics",
+    "glaciers",
+    "GIS",
+    "AIS",
+    "landwaterstorage",
+]
+
+
+# ---------------------------------------------------------------------------
+# Skew-normal fitting
+# ---------------------------------------------------------------------------
+
+def fit_skewnorm_to_quantiles(q05, q17, q50, q83, q95):
+    """Fit skew-normal (alpha, loc, scale) to 5 IPCC quantiles.
+
+    Uses multiple starting points for alpha to avoid the symmetric
+    local minimum.  Returns parameters for scipy.stats.skewnorm.
+    """
+    targets = np.array([q05, q17, q50, q83, q95])
+    probs = np.array([0.05, 0.17, 0.50, 0.83, 0.95])
+
+    # Normalize for conditioning
+    t_scale = max(targets.max() - targets.min(), 1.0)
+    t_center = targets.mean()
+    targets_n = (targets - t_center) / t_scale
+
+    def cost(params):
+        loc_n, log_s, a = params
+        return np.sum(
+            (skewnorm.ppf(probs, a, loc=loc_n, scale=np.exp(log_s))
+             - targets_n) ** 2
+        )
+
+    asym_sign = 1.0 if (q95 - q50) > (q50 - q05) else -1.0
+    s0 = (q83 - q17) / (1.35 * t_scale)
+    loc0 = (q50 - t_center) / t_scale
+
+    best_res, best_cost = None, np.inf
+    for a0 in [0.0, 2 * asym_sign, 5 * asym_sign, 10 * asym_sign]:
+        res = minimize(
+            cost,
+            [loc0, np.log(max(s0, 0.01)), a0],
+            method="Nelder-Mead",
+            options={"xatol": 1e-8, "fatol": 1e-10, "maxiter": 10000},
+        )
+        if res.fun < best_cost:
+            best_cost, best_res = res.fun, res
+
+    loc_n, log_s, alpha = best_res.x
+    return alpha, loc_n * t_scale + t_center, np.exp(log_s) * t_scale
+
+
+def fit_normal_to_quantiles(q05, q17, q50, q83, q95):
+    """Normal (mu, sigma) from the 5 IPCC quantiles.
+
+    mu is the median; sigma is the mean of |q_p - q50| / |z_p| over the
+    four non-median quantiles. Returns (alpha=0, loc, scale) in
+    scipy.stats.skewnorm parameterization (alpha = 0 is the normal).
+    """
+    z = {0.05: 1.6449, 0.17: 0.9542, 0.83: 0.9542, 0.95: 1.6449}
+    devs = [abs(q05 - q50) / z[0.05], abs(q17 - q50) / z[0.17],
+            abs(q83 - q50) / z[0.83], abs(q95 - q50) / z[0.95]]
+    return 0.0, float(q50), float(np.mean(devs))
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(n_samples=N_SAMPLES, seed=777, n_ridge=10000, ridge_seed=888):
+    rng = np.random.default_rng(seed)
+    rng_ridge = np.random.default_rng(ridge_seed)
+    # SSP1-1.9 was added later; separate generators keep the other draws unchanged.
+    rng_119 = np.random.default_rng(seed + 1)
+    rng_ridge_119 = np.random.default_rng(ridge_seed + 1)
+
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Write to a temp file, then replace — avoids cloud-sync folder
+    # lock conflicts on macOS.
+    import tempfile, shutil
+    _tmp_fd, _tmp_path = tempfile.mkstemp(suffix=".h5", dir=str(PROCESSED_DIR))
+    os.close(_tmp_fd)
+
+    with h5py.File(_tmp_path, "w") as f:
+        f.attrs["n_samples"] = n_samples
+        f.attrs["n_ridge"] = n_ridge
+        f.attrs["seed"] = seed
+        f.attrs["ridge_seed"] = ridge_seed
+        f.attrs["baseline_year"] = BASELINE_YEAR
+        f.attrs["rebase_mm_total"] = _IPCC_REBASE_MM
+
+        for comp in IPCC_COMPONENTS:
+            print(f"\n{comp}:")
+
+            for ssp, code in SSP_TO_CODE.items():
+                data = read_ipcc_component_nc(
+                    str(CONF_BASE), "medium_confidence", code, comp
+                )
+                if data is None:
+                    print(f"  {ssp}: not found — skipping")
+                    continue
+
+                ie = ipcc_extract(
+                    data, quantiles_target=(0.05, 0.17, 0.5, 0.83, 0.95)
+                )
+                years = ie["years"]
+                n_years = len(years)
+
+                # Rebase from IPCC native (~2005) to BASELINE_YEAR (total only)
+                if _IPCC_REBASE_MM != 0.0 and comp in _IPCC_REBASE_COMPONENTS:
+                    for qk in ("q05", "q17", "q50", "q83", "q95"):
+                        ie[qk] = ie[qk] + _IPCC_REBASE_MM
+
+                # Fit skew-normal (or normal, see NORMAL_COMPONENTS) at each year
+                _fit = (fit_normal_to_quantiles if comp in NORMAL_COMPONENTS
+                        else fit_skewnorm_to_quantiles)
+                alphas = np.zeros(n_years)
+                locs = np.zeros(n_years)
+                scales = np.zeros(n_years)
+
+                for j in range(n_years):
+                    a, loc, scale = _fit(
+                        ie["q05"][j], ie["q17"][j], ie["q50"][j],
+                        ie["q83"][j], ie["q95"][j],
+                    )
+                    alphas[j] = a
+                    locs[j] = loc
+                    scales[j] = scale
+
+                # Draw MC samples (mm) — standard count for component use.
+                # One uniform quantile per member, reused at every node, so
+                # each member follows a single quantile path through time
+                # (drawing each node independently made per-member paths
+                # incoherent; 2050-2060 correlation was ~0). Marginals at
+                # each node are unchanged.
+                u = (rng_119 if ssp == "SSP1-1.9" else rng).uniform(size=n_samples)
+                samples_mm = np.zeros((n_samples, n_years))
+                for j in range(n_years):
+                    if scales[j] > 0:
+                        samples_mm[:, j] = skewnorm.ppf(
+                            u, alphas[j], loc=locs[j], scale=scales[j])
+                    else:  # degenerate node (e.g. the all-zero 2005 node)
+                        samples_mm[:, j] = locs[j]
+
+                # Draw oversampled set (mm) — for ridge plots. Consumed only
+                # as per-year marginals, so nodes are drawn independently.
+                ridge_mm = np.zeros((n_ridge, n_years))
+                for j in range(n_years):
+                    ridge_mm[:, j] = skewnorm.rvs(
+                        alphas[j], loc=locs[j], scale=scales[j],
+                        size=n_ridge,
+                        random_state=rng_ridge_119 if ssp == "SSP1-1.9" else rng_ridge,
+                    )
+
+                # Save parameters
+                grp_p = f.create_group(f"params/{comp}/{ssp}")
+                grp_p.create_dataset("years", data=years)
+                grp_p.create_dataset("alpha", data=alphas)
+                grp_p.create_dataset("loc", data=locs)
+                grp_p.create_dataset("scale", data=scales)
+                # Store raw quantiles for reference
+                grp_p.create_dataset("q05", data=ie["q05"])
+                grp_p.create_dataset("q17", data=ie["q17"])
+                grp_p.create_dataset("q50", data=ie["q50"])
+                grp_p.create_dataset("q83", data=ie["q83"])
+                grp_p.create_dataset("q95", data=ie["q95"])
+
+                # Save standard samples
+                grp_s = f.create_group(f"samples/{comp}/{ssp}")
+                grp_s.create_dataset(
+                    "samples", data=samples_mm,
+                    chunks=(min(n_samples, 500), n_years),
+                    compression="gzip", compression_opts=4,
+                )
+                grp_s.create_dataset("years", data=years)
+
+                # Save oversampled (ridge) samples
+                grp_r = f.create_group(f"ridge/{comp}/{ssp}")
+                grp_r.create_dataset(
+                    "samples", data=ridge_mm,
+                    chunks=(min(n_ridge, 1000), n_years),
+                    compression="gzip", compression_opts=4,
+                )
+                grp_r.create_dataset("years", data=years)
+
+                med_2100 = ie["q50"][np.argmin(np.abs(years - 2100))]
+                print(f"  {ssp}: {n_years} years, q50@2100={med_2100:.0f} mm")
+
+    # Atomic replace: move temp file over the target
+    shutil.move(_tmp_path, str(OUTPUT_PATH))
+    size_mb = os.path.getsize(OUTPUT_PATH) / 1024**2
+    print(f"\nSaved: {OUTPUT_PATH}  ({size_mb:.1f} MB)")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Precompute IPCC AR6 skew-normal fits and samples."
+    )
+    parser.add_argument("--n-samples", type=int, default=N_SAMPLES)
+    parser.add_argument("--seed", type=int, default=777)
+    parser.add_argument("--n-ridge", type=int, default=10000)
+    parser.add_argument("--ridge-seed", type=int, default=888)
+    args = parser.parse_args()
+    main(
+        n_samples=args.n_samples,
+        seed=args.seed,
+        n_ridge=args.n_ridge,
+        ridge_seed=args.ridge_seed,
+    )

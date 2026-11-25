@@ -1,0 +1,275 @@
+"""
+Project-wide configuration constants.
+
+All notebooks and modules should import from here rather than defining
+their own copies. This is the single source of truth for baselines,
+ensemble sizes, random seeds, and directory paths.
+"""
+
+import os
+import re
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Baseline
+# ---------------------------------------------------------------------------
+BASELINE_YEAR: float = 2000.0
+"""Reference year for sea-level and temperature anomalies.
+2000 matches the paper's convention of reporting 21st-century
+contributions relative to the year 2000."""
+
+WAIS_ONSET_YEAR: float = 2010.0
+"""Year at which WAIS contribution begins ramping.  Physically motivated
+by the IMBIE structural break (~2010) when WAIS mass loss accelerated.
+Distinct from BASELINE_YEAR to allow independent adjustment."""
+
+BASELINE_WINDOW: tuple[int, int] = (1995, 2005)
+"""Averaging window (inclusive start, inclusive end: 11 annual values)
+used when rebasing anomaly series to BASELINE_YEAR; centered on 2000.
+Imported by component_ocean; the other components and readers write the
+same 1995-2005 window as literals (e.g. ``reference_period=(1995, 2006)``
+with an exclusive end)."""
+
+# ---------------------------------------------------------------------------
+# Thermosteric upper-layer response-time prior
+# ---------------------------------------------------------------------------
+TAU_U_PRIOR_MEDIAN_YR: float = 8.0
+TAU_U_PRIOR_LOG_SD: float = 0.5
+"""Prior on the upper-layer relaxation time of the two-layer thermosteric
+model: ln tau_u ~ N(ln TAU_U_PRIOR_MEDIAN_YR, TAU_U_PRIOR_LOG_SD**2), tau_u in
+years, consistent with the 4-17 yr range of Geoffroy et al. (2013, Table 4).
+Used by component_ocean and printed by scripts/manuscript_numbers.py."""
+
+# ---------------------------------------------------------------------------
+# Thermosteric equation of state
+# ---------------------------------------------------------------------------
+KAPPA_EOS: float = 0.26497
+"""Equation-of-state coefficient (1/m) tying the thermosteric quadratic
+coefficient to the linear one in the two-layer model: a_u = KAPPA_EOS * b_u**2
+(a_u in m/C^2, b_u in m/C).  KAPPA_EOS = 1/2 int f alpha' g^2 dz / (int f alpha_0 g dz)^2
+over 0-700 m, with TEOS-10 alpha and d(alpha)/d(CT) from the EN4.2.2 1995-2005
+mean temperature and salinity, a uniform profile shape g, and f(z) the wet-area
+fraction of the sea surface at depth z (the records are global-mean heights).  Printed by
+scripts/thermosteric_eos_coefficient.py.  a_u is not fitted: the NOAA records
+after 1990 leave a free a_u unconstrained.
+Imported by component_ocean.ipynb and scripts/ocean_early_holdout.py."""
+
+GEOFFROY2013_C0: tuple = (53, 90, 71, 69, 99, 69, 127, 105, 126, 82, 317, 95, 145, 71, 64, 105.)
+GEOFFROY2013_GAMMA: tuple = (0.67, 0.53, 0.59, 0.93, 0.50, 0.88, 0.76, 0.90, 1.16, 0.55,
+                             0.65, 0.59, 0.76, 0.72, 0.66, 0.88)
+"""Deep-ocean heat capacity C_0 (W yr m-2 K-1) and exchange coefficient gamma
+(W m-2 K-1) of the 16 CMIP5 models in Geoffroy et al. (2013), Table 4, in the
+table's order.  The thermosteric deep-layer time scale tau_d = C_0 / gamma has a
+lognormal prior with the mean and sample SD of log(C_0 / gamma)
+(component_ocean.ipynb cell 5, scripts/thermosteric_record_sensitivity.py)."""
+
+# ---------------------------------------------------------------------------
+# Monte Carlo / sampling
+# ---------------------------------------------------------------------------
+def _n_samples_from_env(default: int) -> int:
+    """Ensemble size from the environment variable SLR_N_SAMPLES, else *default*.
+
+    Unset or blank gives *default*.  Otherwise the value, stripped of
+    surrounding whitespace, must be ASCII decimal digits only (no sign,
+    underscores, exponent or non-ASCII digits) and at least 1."""
+    raw = os.environ.get("SLR_N_SAMPLES", "").strip()
+    if not raw:
+        return default
+    if not re.fullmatch(r"[0-9]+", raw):
+        raise ValueError(f"SLR_N_SAMPLES must be a positive integer, got {raw!r}")
+    n = int(raw)
+    if n < 1:
+        raise ValueError(f"SLR_N_SAMPLES must be a positive integer, got {raw!r}")
+    return n
+
+
+N_SAMPLES: int = _n_samples_from_env(10000)
+"""Default number of Monte Carlo ensemble members for projections.
+10000 (the production run) unless the environment variable SLR_N_SAMPLES is
+set, e.g. ``SLR_N_SAMPLES=500 ./run_pipeline.sh`` for a quick test run.  Every
+module and notebook imports N_SAMPLES from here, so the variable must be set
+for the whole pipeline run.  A reduced run overwrites the production results
+in data/processed/ in place.
+
+These ensemble sizes do not follow SLR_N_SAMPLES:
+  - component_wais.ipynb: N_SAMPLES = max(10_000, N_SAMPLES) for the A4
+    mixture (its export is downsampled to N_SAMPLES);
+  - scripts/build_slow_wais_p90.py: N_OUT = 20_000 draws of the slow-WAIS
+    mixture;
+  - component_forecast.ipynb: N_RIDGE = 10_000 for the ridge plots;
+  - component_summation.ipynb: _n_mc_sq = 10_000 draws for the satellite-era
+    quadratic interval;
+  - notebooks/precompute_ipcc_distributions.py: n_ridge=10000 IPCC ridge
+    samples (--n-ridge).
+Fixed draw counts for bootstraps, posterior subsamples, comparison samples,
+diagnostic sweeps and MCMC chains do not follow SLR_N_SAMPLES either, e.g. the
+10000-draw IPCC histogram samples (rng_hist) in component_ocean,
+component_glacier and component_greenland, the _N_BOOT = 2000 rate-doubling
+bootstrap in results_figures.ipynb, N_SWEEP_TRAJ = 5_000 and the
+100_000-200_000-draw endpoint sweeps in component_wais.ipynb, and
+N_DRAW = 4000 in scripts/ocean_early_holdout.py and
+scripts/glacier_delayed_response.py."""
+
+SEEDS: dict[str, int] = {
+    "projections": 42,
+    "bayesian": 42,
+    "tests": 42,
+    "warming": 2027,
+    "thermo_scale": 2028,
+}
+"""Named random seeds for reproducibility.  Use as:
+    rng = np.random.default_rng(SEEDS['projections'])
+"""
+
+THERMO_SCALE_SD: float = 0.05
+"""Standard deviation of the common scale error of the bias-corrected NOAA
+thermosteric records (the x1.14 correction of Li et al. 2022).  An error in
+that scale is the same in every year, so component_ocean draws one factor
+from N(1, THERMO_SCALE_SD**2) per projection member (seed
+SEEDS['thermo_scale']) and multiplies the member's 0-2000 m contribution by
+it; the below-2000 m term is not scaled.  0 switches the factor off."""
+
+SAMPLE_WARMING_PATHS: bool = True
+"""Propagate within-scenario GMST uncertainty (forcing uncertainty) into the
+component projections.  Each ensemble member k follows one percentile path
+z_k of the IPCC AR6 SSP GMST distribution for the whole century, and the same
+z_k is used by every component and every SSP (see notebooks/warming_paths.py).
+False restores the earlier behavior: the median SSP path for every member,
+with independent year-to-year noise in the thermosteric component only."""
+
+WARMING_ANCHOR_YEAR: float = 2024.0
+"""Year up to which the sampled warming offset is zero.  Warming to date is
+observed, so the AR6 spread is applied only as growth beyond this year."""
+
+# ---------------------------------------------------------------------------
+# Directory layout
+# ---------------------------------------------------------------------------
+# PROJECT_ROOT is <repo>/slr_forecast/ regardless of where the caller lives.
+# We locate it relative to this file: src/slr_forecast/config.py → ../../
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[2]
+
+DATA_DIR: Path = PROJECT_ROOT / "data"
+RAW_DATA_DIR: Path = DATA_DIR / "raw"
+PROCESSED_DATA_DIR: Path = DATA_DIR / "processed"
+
+H5_OBS_PATH: Path = PROCESSED_DATA_DIR / "slr_processed_data.h5"
+"""Observational data (NASA GMSL, Frederikse, Berkeley Earth, kinematics)."""
+
+H5_COMP_PATH: Path = PROCESSED_DATA_DIR / "component_results.h5"
+"""Per-component projection ensembles and fitted parameters."""
+
+# Keep H5_PATH as alias for backward compatibility
+H5_PATH: Path = H5_OBS_PATH
+
+FIG_DIR: Path = PROJECT_ROOT / "figures"
+
+# ---------------------------------------------------------------------------
+# Thermosteric volcanic term
+# ---------------------------------------------------------------------------
+VOLC_ERF_CSV: Path = RAW_DATA_DIR / "forcing/igcc2024/ERF_best_aggregates_1750-2024.csv"
+"""Annual effective radiative forcing, column 'volcanic' (W m-2): Indicators
+of Global Climate Change 2024 (Forster et al. 2025), data release v2025.06.11,
+doi:10.5281/zenodo.15639576; provenance in data/raw/forcing/README.md and
+data/data_manifest.md.  AR6 convention: anomaly from the 500 BCE-1749 mean,
+mean over 1850-2024 near zero.
+Zero after the last year of the record, as in the AR6 SSP forcing."""
+
+THERMO_VOLC_KV: float = 0.71 * 5.10e14 * 3.156e7 * (0.41e-3 / (16.7 / (24.0 / 0.43) * 1e22))
+"""Volcanic term of the thermosteric upper layer, m of 0-700 m thermosteric
+sea level per (W m-2 yr): ocean fraction 0.71 x Earth area 5.10e14 m2 x
+3.156e7 s/yr x the NOAA 0-700 m expansion efficiency of Levitus et al. (2012),
+0.41 mm/yr over a heat-content trend of 16.7e22 J / (24.0e22 J / 0.43e22 J/yr)
+= 0.137 m/YJ.  The upper layer obeys dS_u/dt = (T - S_u)/tau_u + k_v F_v with
+k_v = m * THERMO_VOLC_KV / b_u (C/yr per W m-2); m is sampled."""
+
+THERMO_VOLC_M_SD: float = float((0.25 / 1.645) ** 2 + (0.013 / 0.113) ** 2) ** 0.5
+"""Standard deviation of the Gaussian prior on m, m ~ N(1, sd): volcanic ERF
+scale +/-25% (5-95%; AR6 WG1 Ch. 7, -20 +/- 5 W m-2 per unit stratospheric
+aerosol optical depth) combined in quadrature with the relative uncertainty of
+the AR6 expansion efficiency, 0.013/0.113 (used for the 0-700 m value)."""
+
+# ---------------------------------------------------------------------------
+# SSP definitions
+# ---------------------------------------------------------------------------
+SSPS: list[str] = [
+    "SSP1-1.9",
+    "SSP1-2.6",
+    "SSP2-4.5",
+    "SSP3-7.0",
+    "SSP5-8.5",
+]
+"""Available SSP scenarios in the IPCC AR6 FACTS projections."""
+
+# ---------------------------------------------------------------------------
+# Physical / unit constants
+# ---------------------------------------------------------------------------
+GT_TO_M_SLE: float = 1.0 / 362500.0
+"""Gigatonnes of ice to meters of sea-level equivalent."""
+
+PREIND_TO_1900_M: float = 0.010
+"""GMSL rise from the pre-industrial (1850-1900) mean to 1900 (meters).
+The 1850-1900 mean sits ~25 yr before 1900, and the late-19th-century rate
+was 0-1 mm/yr: Kopp et al. (2016, PNAS, p. E1436) give 0.0 +/- 0.4 mm/yr
+(2 sigma) for 1800-1900, and AR6 WG1 Ch. 9 (p. 1295) dates the onset of the
+sustained rise to 1820-1860. 25 yr x 0-1 mm/yr gives 0.010 [0.000, 0.025] m.
+The observed rise from 1900 to BASELINE_YEAR is computed from the
+reconstructions by ``component_analysis.preindustrial_to_baseline_m``."""
+
+# ---------------------------------------------------------------------------
+# Statistical constants
+# ---------------------------------------------------------------------------
+Z_94: float = 1.881
+"""z-score for the 94% highest-density interval (two-tailed)."""
+
+Z_90: float = 1.645
+"""z-score for the 90% confidence interval (two-tailed)."""
+
+Z_95: float = 1.96
+"""z-score for the 95% confidence interval (two-tailed)."""
+
+# ---------------------------------------------------------------------------
+# IPCC AR6 reference
+# ---------------------------------------------------------------------------
+IPCC_CONFIDENCE: str = "medium_confidence"
+"""Confidence tier used when reading IPCC AR6 SLC NetCDF projections."""
+
+IPCC_REF_PERIOD: tuple[int, int] = (1995, 2014)
+"""IPCC AR6 reference period for sea-level projections."""
+
+SAT_ERA_START: float = 1993.0
+"""Start of the satellite altimetry era (TOPEX/Poseidon launch)."""
+
+# ---------------------------------------------------------------------------
+# Hamlington et al. (2024) satellite-era quadratic fit
+# Comm. Earth Environ. 5:601, doi:10.1038/s43247-024-01761-5
+# Quadratic fit to NASA altimetry 1993–2024.
+# Rate at time t:  rate(t) = HAMLINGTON_ACCEL * (t - HAMLINGTON_T_REF) + HAMLINGTON_RATE
+# All uncertainties are 90% CI.
+# ---------------------------------------------------------------------------
+HAMLINGTON_RATE: float = 3.3
+"""Mean rate of GMSL rise over 1993–2024 (mm/yr), ref. to midpoint of record."""
+
+HAMLINGTON_RATE_UNC: float = 0.3
+"""90% CI half-width on HAMLINGTON_RATE (mm/yr)."""
+
+HAMLINGTON_ACCEL: float = 0.08
+"""Acceleration of GMSL rise (mm/yr²)."""
+
+HAMLINGTON_ACCEL_UNC: float = 0.06
+"""90% CI half-width on HAMLINGTON_ACCEL (mm/yr²)."""
+
+HAMLINGTON_T_REF: float = 2008.5
+"""Reference time (midpoint of 1993–2024 record)."""
+
+# ---------------------------------------------------------------------------
+# Scenario labels
+# ---------------------------------------------------------------------------
+WARMING_C: dict[str, float] = {
+    "SSP1-1.9": 1.4,
+    "SSP1-2.6": 1.8,
+    "SSP2-4.5": 2.7,
+    "SSP3-7.0": 3.6,
+    "SSP5-8.5": 4.4,
+}
+"""AR6 central estimate of 2081-2100 warming above 1850-1900 for each SSP
+(Lee et al. 2021, Table 4.5), used to label scenarios in text and figures."""

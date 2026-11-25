@@ -1,0 +1,645 @@
+"""Unit tests for the component forecast notebook.
+
+Tests cover: component loading and summation, rate-space blending,
+sigmoid weight function, headline statistics, variance decomposition,
+IPCC comparison data, and physical plausibility of total forecasts.
+"""
+
+import sys
+import os
+import json
+
+import numpy as np
+import pytest
+from scipy.special import expit
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'notebooks'))
+
+from component_io import (
+    load_all_projections, load_component, list_components,
+    PROJ_SSPS, PROJ_YEARS, N_SAMPLES,
+)
+from component_projections import read_ipcc_component_nc, ipcc_extract
+
+# Paths
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+H5_PATH = os.path.join(PROJECT_ROOT, 'data', 'processed', 'component_results.h5')
+OBS_H5_PATH = os.path.join(PROJECT_ROOT, 'data', 'processed', 'slr_processed_data.h5')
+IPCC_DIST_PATH = os.path.join(PROJECT_ROOT, 'data', 'processed', 'ipcc_distributions.h5')
+HEADLINE_PATH = os.path.join(PROJECT_ROOT, 'data', 'processed',
+                              'manuscript_headline_stats.json')
+RAW_DIR = os.path.join(PROJECT_ROOT, 'data', 'raw')
+CONF_BASE = os.path.join(
+    RAW_DIR, 'ipcc_ar6', 'slr', 'ar6', 'global', 'confidence_output_files')
+
+HAS_H5 = os.path.exists(H5_PATH)
+HAS_IPCC_DIST = os.path.exists(IPCC_DIST_PATH)
+HAS_HEADLINE = os.path.exists(HEADLINE_PATH)
+HAS_IPCC = os.path.exists(os.path.join(
+    CONF_BASE, 'medium_confidence', 'ssp245'))
+
+from slr_forecast import M_TO_MM
+
+# PROJ_SSPS is append-only (SSP1-1.9 is last), so order by 2100 forcing
+# (W/m^2, the number after the dash) for monotonicity checks.
+SSPS_BY_FORCING = sorted(PROJ_SSPS, key=lambda s: float(s.split('-')[-1]))
+from slr_forecast.config import BASELINE_YEAR
+
+# Expected components in HDF5
+EXPECTED_COMPONENTS = ['ocean', 'glacier', 'greenland', 'apeninsula', 'wais', 'eais']
+
+
+# =========================================================================
+# Component loading
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_H5, reason="component_results.h5 not found")
+class TestLoadAllProjections:
+    """Verify load_all_projections returns correct structure."""
+
+    @pytest.fixture(scope="class")
+    def loaded(self):
+        return load_all_projections()
+
+    def test_returns_tuple(self, loaded):
+        proj_years, all_proj = loaded
+        assert isinstance(proj_years, np.ndarray)
+        assert isinstance(all_proj, dict)
+
+    def test_proj_years_shape(self, loaded):
+        proj_years, _ = loaded
+        assert proj_years.shape == (201,)
+        assert proj_years[0] == 1950.0
+        assert proj_years[-1] == 2150.0
+
+    def test_all_components_present(self, loaded):
+        _, all_proj = loaded
+        for comp in EXPECTED_COMPONENTS:
+            assert comp in all_proj, f"Missing component: {comp}"
+
+    def test_all_ssps_per_component(self, loaded):
+        _, all_proj = loaded
+        for comp in EXPECTED_COMPONENTS:
+            for ssp in PROJ_SSPS:
+                assert ssp in all_proj[comp], (
+                    f"Missing {ssp} in {comp}")
+
+    def test_samples_shape(self, loaded):
+        """All components should have samples for at least one SSP."""
+        proj_years, all_proj = loaded
+        for comp in EXPECTED_COMPONENTS:
+            # SSP-independent components (WAIS) may only have samples
+            # under the first SSP via load_all_projections
+            found = False
+            for ssp in PROJ_SSPS:
+                if 'samples' in all_proj[comp][ssp]:
+                    samples = all_proj[comp][ssp]['samples']
+                    assert samples.shape[1] == len(proj_years), (
+                        f"{comp}/{ssp} shape = {samples.shape}")
+                    assert samples.shape[0] >= N_SAMPLES, (
+                        f"{comp}/{ssp} has {samples.shape[0]} samples, need >= {N_SAMPLES}")
+                    found = True
+                    break
+            assert found, f"{comp} has no samples in any SSP"
+
+    def test_percentile_keys(self, loaded):
+        _, all_proj = loaded
+        for key in ('median', 'p5', 'p17', 'p83', 'p95'):
+            assert key in all_proj['ocean']['SSP2-4.5'], (
+                f"Missing '{key}' in ocean SSP2-4.5")
+
+
+# =========================================================================
+# Component summation
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_H5, reason="component_results.h5 not found")
+class TestComponentSummation:
+    """Verify that summing components produces correct totals."""
+
+    @pytest.fixture(scope="class")
+    def comp_samples(self):
+        """Load all components, downsampling to N_SAMPLES if needed."""
+        samples = {}
+        for comp in EXPECTED_COMPONENTS:
+            loaded = load_component(comp)
+            proj = loaded['projections']
+            for ssp in proj:
+                if proj[ssp]['samples'].shape[0] > N_SAMPLES:
+                    proj[ssp]['samples'] = proj[ssp]['samples'][:N_SAMPLES]
+            samples[comp] = proj
+        return samples
+
+    def test_sum_positive_at_2100(self, comp_samples):
+        """Total SLR at 2100 should be positive for all SSPs."""
+        idx = np.argmin(np.abs(PROJ_YEARS - 2100))
+        for ssp in PROJ_SSPS:
+            total = np.zeros(N_SAMPLES)
+            for comp in EXPECTED_COMPONENTS:
+                total += comp_samples[comp][ssp]['samples'][:, idx]
+            assert np.median(total) > 0
+
+    def test_ocean_dominates_at_2050(self, comp_samples):
+        """Ocean should be largest positive contributor at 2050."""
+        ssp = 'SSP2-4.5'
+        idx = np.argmin(np.abs(PROJ_YEARS - 2050))
+        ocean_med = np.median(comp_samples['ocean'][ssp]['samples'][:, idx])
+        for comp in ['glacier', 'greenland', 'apeninsula']:
+            comp_med = np.median(comp_samples[comp][ssp]['samples'][:, idx])
+            assert ocean_med > comp_med, (
+                f"Ocean ({ocean_med*M_TO_MM:.0f}) should exceed "
+                f"{comp} ({comp_med*M_TO_MM:.0f})")
+
+    def test_eais_negative(self, comp_samples):
+        """EAIS should contribute negative SLR (mass gain)."""
+        ssp = 'SSP2-4.5'
+        idx = np.argmin(np.abs(PROJ_YEARS - 2100))
+        eais_med = np.median(comp_samples['eais'][ssp]['samples'][:, idx])
+        assert eais_med < 0, f"EAIS median = {eais_med*M_TO_MM:.0f} mm, expected < 0"
+
+    def test_ssp_ordering_of_total(self, comp_samples):
+        """Higher SSP → higher total SLR at 2100."""
+        idx = np.argmin(np.abs(PROJ_YEARS - 2100))
+        medians = []
+        for ssp in SSPS_BY_FORCING:
+            total = np.zeros(N_SAMPLES)
+            for comp in EXPECTED_COMPONENTS:
+                total += comp_samples[comp][ssp]['samples'][:, idx]
+            medians.append(np.median(total))
+        for i in range(len(medians) - 1):
+            # WAIS is SSP-independent, so ordering may be soft
+            assert medians[i] <= medians[i + 1] * 1.05
+
+
+# =========================================================================
+# Sigmoid blending weight
+# =========================================================================
+
+class TestSigmoidWeight:
+    """Verify sigmoid blending weight properties."""
+
+    def test_weight_at_center(self):
+        """w(t_center) should be exactly 0.5."""
+        t_center = 2035.0
+        tau = 5.0
+        w = 1.0 - expit((t_center - t_center) / tau)
+        assert abs(w - 0.5) < 1e-10
+
+    def test_weight_at_origin(self):
+        """w(t_origin) should be close to 1 (trust quadratic)."""
+        t_center = 2035.0
+        tau = 5.0
+        t_origin = 2025.3
+        w = 1.0 - expit((t_origin - t_center) / tau)
+        assert w > 0.8, f"w at origin = {w:.3f}, expected > 0.8"
+
+    def test_weight_at_2100(self):
+        """w(2100) should be near zero (trust components)."""
+        t_center = 2035.0
+        tau = 5.0
+        w = 1.0 - expit((2100 - t_center) / tau)
+        assert w < 1e-4, f"w at 2100 = {w:.6f}, expected < 1e-4"
+
+    def test_weight_monotonically_decreasing(self):
+        """w(t) should decrease monotonically."""
+        t_center = 2035.0
+        tau = 5.0
+        years = np.arange(2025, 2101, dtype=float)
+        w = 1.0 - expit((years - t_center) / tau)
+        assert np.all(np.diff(w) <= 0)
+
+    def test_weight_bounded_0_1(self):
+        """w(t) should always be in [0, 1]."""
+        t_center = 2035.0
+        tau = 5.0
+        years = np.arange(1990, 2200, dtype=float)
+        w = 1.0 - expit((years - t_center) / tau)
+        assert np.all(w >= 0) and np.all(w <= 1)
+
+    def test_tau_controls_width(self):
+        """Smaller tau → sharper transition."""
+        t_center = 2035.0
+        t_test = 2030.0
+        w_narrow = 1.0 - expit((t_test - t_center) / 2.0)
+        w_wide = 1.0 - expit((t_test - t_center) / 10.0)
+        # Narrow tau at t_test < t_center: w_narrow should be closer to 1
+        assert w_narrow > w_wide
+
+
+# =========================================================================
+# Rate-space blending function
+# =========================================================================
+
+class TestBlendRateSpace:
+    """Verify the production blend_rate_space with synthetic data."""
+
+    @staticmethod
+    def _make_blend_func():
+        """The function component_forecast.ipynb calls."""
+        from component_projections import blend_rate_space
+        return blend_rate_space
+
+    def test_output_shape(self):
+        blend = self._make_blend_func()
+        proj_years = np.arange(2000, 2101, dtype=float)
+        n = 50
+        comp = np.cumsum(np.ones((n, 101)) * 0.003, axis=1)  # linear 3mm/yr
+        sq_time = np.arange(2000, 2101, dtype=float)
+        sq_rate = np.ones((n, 101)) * 0.004  # 4mm/yr quadratic rate
+        sq_level = np.cumsum(sq_rate * 1.0, axis=1)
+        f_samp, f_years, w = blend(proj_years, comp, sq_rate, sq_level,
+                                    sq_time, 2025.0, 0.05, 2035.0, 5.0)
+        assert f_samp.shape[0] == n
+        assert f_samp.shape[1] == len(f_years)
+        assert f_years[0] >= 2025.0
+
+    def test_starts_at_h_origin(self):
+        blend = self._make_blend_func()
+        proj_years = np.arange(2000, 2101, dtype=float)
+        n = 10
+        comp = np.cumsum(np.ones((n, 101)) * 0.003, axis=1)
+        sq_time = np.arange(2000, 2101, dtype=float)
+        sq_rate = np.ones((n, 101)) * 0.004
+        sq_level = np.cumsum(sq_rate, axis=1)
+        h_origin = 0.069
+        f_samp, f_years, _ = blend(proj_years, comp, sq_rate, sq_level,
+                                    sq_time, 2025.0, h_origin, 2035.0, 5.0)
+        assert np.allclose(f_samp[:, 0], h_origin)
+
+    def test_monotonically_increasing(self):
+        """With positive rates, forecast should increase monotonically."""
+        blend = self._make_blend_func()
+        proj_years = np.arange(2000, 2101, dtype=float)
+        n = 10
+        comp = np.cumsum(np.ones((n, 101)) * 0.005, axis=1)
+        sq_time = np.arange(2000, 2101, dtype=float)
+        sq_rate = np.ones((n, 101)) * 0.004
+        sq_level = np.cumsum(sq_rate, axis=1)
+        f_samp, _, _ = blend(proj_years, comp, sq_rate, sq_level,
+                              sq_time, 2025.0, 0.05, 2035.0, 5.0)
+        # Median should be monotonically increasing
+        med = np.median(f_samp, axis=0)
+        assert np.all(np.diff(med) >= -1e-10)
+
+    def test_pure_quadratic_early(self):
+        """At origin, forecast rate should be close to quadratic rate."""
+        blend = self._make_blend_func()
+        proj_years = np.arange(2000, 2101, dtype=float)
+        n = 10
+        # Component has zero rate; quadratic has 5mm/yr
+        comp = np.zeros((n, 101))
+        sq_time = np.arange(2000, 2101, dtype=float)
+        sq_rate = np.ones((n, 101)) * 0.005
+        sq_level = np.cumsum(sq_rate, axis=1)
+        f_samp, f_years, w = blend(proj_years, comp, sq_rate, sq_level,
+                                    sq_time, 2025.0, 0.0, 2035.0, 5.0)
+        # At origin, w ~ 0.86, so forecast rate ≈ 0.86 * 5mm/yr = 4.3mm/yr
+        # After 1 year: H ≈ 0 + 4.3mm = 0.0043m
+        assert f_samp[0, 1] > 0.003, (
+            f"H at t+1 = {f_samp[0,1]*M_TO_MM:.2f} mm, expected > 3 mm")
+
+    def test_off_grid_origin_partial_step(self):
+        """An origin between grid years is integrated to the first grid
+        year, not assigned to it (the forecast would otherwise lag)."""
+        blend = self._make_blend_func()
+        proj_years = np.arange(2000, 2101, dtype=float)
+        n = 4
+        comp = np.zeros((n, 101))                 # zero component rate
+        sq_time = proj_years.copy()
+        sq_rate = np.full((n, 101), 0.005)        # constant 5 mm/yr
+        sq_level = np.cumsum(sq_rate, axis=1)
+        t_origin, h0, t_c, tau = 2025.3, 0.07, 2035.0, 5.0
+        f_samp, f_years, _ = blend(proj_years, comp, sq_rate, sq_level,
+                                   sq_time, t_origin, h0, t_c, tau)
+        assert f_years[0] == 2026.0
+        w_o = 1.0 - expit((t_origin - t_c) / tau)
+        w_1 = 1.0 - expit((f_years[0] - t_c) / tau)
+        expected = h0 + 0.5 * (w_o + w_1) * 0.005 * (f_years[0] - t_origin)
+        assert np.allclose(f_samp[:, 0], expected, rtol=0, atol=1e-12)
+        assert np.all(f_samp[:, 0] > h0)
+
+    def test_per_sample_origin(self):
+        """An array h_origin gives each sample its own starting level."""
+        blend = self._make_blend_func()
+        proj_years = np.arange(2000, 2101, dtype=float)
+        n = 3
+        comp = np.zeros((n, 101))
+        sq_rate = np.zeros((n, 101))
+        h0 = np.array([0.06, 0.07, 0.08])
+        f_samp, _, _ = blend(proj_years, comp, sq_rate, np.zeros((n, 101)),
+                             proj_years, 2025.0, h0, 2035.0, 5.0)
+        assert np.allclose(f_samp, h0[:, None])
+
+
+# =========================================================================
+# Headline statistics JSON
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_HEADLINE, reason="headline JSON not found")
+class TestHeadlineStatistics:
+    """Verify manuscript_headline_stats.json structure and values."""
+
+    @pytest.fixture(scope="class")
+    def headline(self):
+        with open(HEADLINE_PATH) as f:
+            return json.load(f)
+
+    def test_has_required_keys(self, headline):
+        for key in ('baseline_year', 'preindustrial_to_baseline_m',
+                     'forecast_years', 'scenarios'):
+            assert key in headline, f"Missing key: {key}"
+
+    def test_baseline_year(self, headline):
+        assert headline['baseline_year'] == BASELINE_YEAR
+
+    def test_preindustrial_offset(self, headline):
+        """Offset matches the value computed from the GMSL reconstructions."""
+        from component_analysis import preindustrial_to_baseline_m
+        expected, _ = preindustrial_to_baseline_m(OBS_H5_PATH)
+        assert headline['preindustrial_to_baseline_m'] == pytest.approx(
+            expected, abs=1e-6)
+
+    def test_all_ssps_present(self, headline):
+        for ssp in PROJ_SSPS:
+            assert ssp in headline['scenarios']
+
+    def test_report_years(self, headline):
+        expected = list(range(2030, 2110, 10))
+        assert headline['forecast_years'] == expected
+
+    def test_2100_values_plausible(self, headline):
+        """2100 medians should be between 0.6 and 2.0 m rel. preindustrial.
+
+        SSP1-1.9 is 0.70 m with the computed 0.150 m pre-industrial offset.
+        """
+        for ssp in PROJ_SSPS:
+            med = headline['scenarios'][ssp]['2100']['median_m_rel_preindustrial']
+            assert 0.6 < med < 2.0, (
+                f"{ssp} 2100 median = {med:.2f} m, outside [0.6, 2.0]")
+
+    def test_ssp_ordering(self, headline):
+        """Higher SSP → higher median at 2100."""
+        medians = [headline['scenarios'][ssp]['2100']['median_m_rel_preindustrial']
+                    for ssp in SSPS_BY_FORCING]
+        for i in range(len(medians) - 1):
+            assert medians[i] <= medians[i + 1] * 1.01
+
+    def test_exceedance_probabilities_valid(self, headline):
+        """Exceedance probs should be in [0, 100] and decrease with threshold."""
+        for ssp in PROJ_SSPS:
+            st = headline['scenarios'][ssp]['2100']
+            probs = [st[f'P_exceed_{t:.1f}m_preindustrial']
+                     for t in [0.5, 1.0, 1.5, 2.0]]
+            for p in probs:
+                assert 0 <= p <= 100
+            # Higher threshold → lower probability
+            for i in range(len(probs) - 1):
+                assert probs[i] >= probs[i + 1]
+
+    def test_nearly_all_exceed_0_5m(self, headline):
+        """P(>0.5m) should be at least 95% for all SSPs at 2100.
+
+        With the computed 0.150 m pre-industrial offset,
+        SSP1-1.9 is 97.0% and SSP1-2.6 is 98.9%; the other SSPs are 100%.
+        """
+        for ssp in PROJ_SSPS:
+            p = headline['scenarios'][ssp]['2100']['P_exceed_0.5m_preindustrial']
+            assert p >= 95.0, f"{ssp} P(>0.5m) = {p}%, expected >= 95%"
+
+    def test_percentile_ordering(self, headline):
+        """p5 < median < p95 at every report year."""
+        for ssp in PROJ_SSPS:
+            for yr in headline['forecast_years']:
+                st = headline['scenarios'][ssp][str(yr)]
+                assert st['p5_mm_rel_baseline'] <= st['median_mm_rel_baseline']
+                assert st['median_mm_rel_baseline'] <= st['p95_mm_rel_baseline']
+
+
+# =========================================================================
+# Variance decomposition
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_HEADLINE, reason="headline JSON not found")
+class TestVarianceDecomposition:
+    """Verify variance decomposition in headline stats."""
+
+    @pytest.fixture(scope="class")
+    def vd(self):
+        with open(HEADLINE_PATH) as f:
+            h = json.load(f)
+        return h.get('variance_decomposition', {})
+
+    def test_has_required_keys(self, vd):
+        for key in ('within_scenario_var_m2', 'between_scenario_var_m2',
+                     'pct_within_scenario', 'pct_between_scenario'):
+            assert key in vd, f"Missing key: {key}"
+
+    def test_percentages_sum_to_100(self, vd):
+        total = vd['pct_within_scenario'] + vd['pct_between_scenario']
+        assert abs(total - 100.0) < 0.1
+
+    def test_within_dominates(self, vd):
+        """Within-scenario variance should dominate (>80%)."""
+        assert vd['pct_within_scenario'] > 80
+
+    def test_variances_positive(self, vd):
+        assert vd['within_scenario_var_m2'] > 0
+        assert vd['between_scenario_var_m2'] > 0
+
+    def test_total_variance_consistent(self, vd):
+        """within + between should equal total (if present)."""
+        if 'total_var_m2' in vd:
+            total = vd['within_scenario_var_m2'] + vd['between_scenario_var_m2']
+            assert abs(total - vd['total_var_m2']) < 1e-5  # JSON rounding to 6 dp
+
+
+# =========================================================================
+# TWS loading from IPCC distributions
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_IPCC_DIST, reason="ipcc_distributions.h5 not found")
+class TestTWSLoading:
+    """Verify TWS samples can be loaded from precomputed IPCC distributions."""
+
+    def test_load_tws_samples(self):
+        import h5py
+        with h5py.File(IPCC_DIST_PATH, 'r') as f:
+            assert 'samples/landwaterstorage/SSP2-4.5' in f
+
+    def test_tws_shape(self):
+        import h5py
+        with h5py.File(IPCC_DIST_PATH, 'r') as f:
+            grp = f['samples/landwaterstorage/SSP2-4.5']
+            years = grp['years'][:]
+            samples = grp['samples'][:]
+            assert samples.ndim == 2
+            assert len(years) == samples.shape[1]
+            # every draw the file records (SLR_N_SAMPLES at precompute time)
+            assert samples.shape[0] == int(f.attrs['n_samples'])
+
+    def test_tws_units_mm(self):
+        """TWS samples should be in mm (values 0-100 at 2100)."""
+        import h5py
+        with h5py.File(IPCC_DIST_PATH, 'r') as f:
+            grp = f['samples/landwaterstorage/SSP2-4.5']
+            years = grp['years'][:]
+            samples = grp['samples'][:]
+            idx = np.argmin(np.abs(years - 2100))
+            med = np.median(samples[:, idx])
+            assert 5 < med < 100, f"TWS median = {med:.0f}, expected 5-100 mm"
+
+    def test_offset_on_total_only(self):
+        """The AR6-baseline offset is applied to the total only: TWS stays
+        zero at the 2005 node, and the total is shifted by rebase_mm_total
+        (the shared component_analysis.ar6_baseline_offset_m)."""
+        import h5py
+        from component_analysis import ar6_baseline_offset_m
+        with h5py.File(IPCC_DIST_PATH, 'r') as f:
+            off = float(f.attrs['rebase_mm_total'])
+            g = f['samples/landwaterstorage/SSP2-4.5']
+            y, tws = g['years'][:], g['samples'][:]
+            p = f['params/total/SSP2-4.5']
+            q_total = p['q50'][:]   # stored quantiles, after the offset
+            y_total = p['years'][:]
+        assert off == pytest.approx(
+            ar6_baseline_offset_m(OBS_H5_PATH) * M_TO_MM, abs=1e-6)
+        assert np.allclose(tws[:, y == 2005], 0.0)
+        if HAS_IPCC:
+            ex = ipcc_extract(read_ipcc_component_nc(
+                CONF_BASE, 'medium_confidence', 'ssp245', 'total'))
+            i = np.argmin(np.abs(y_total - 2100))
+            j = np.argmin(np.abs(ex['years'] - 2100))
+            assert q_total[i] - ex['q50'][j] == pytest.approx(off, abs=0.5)
+
+    def test_tws_positive(self):
+        """TWS should be positive at 2100 (groundwater depletion → SLR)."""
+        import h5py
+        with h5py.File(IPCC_DIST_PATH, 'r') as f:
+            grp = f['samples/landwaterstorage/SSP2-4.5']
+            years = grp['years'][:]
+            samples = grp['samples'][:]
+            idx = np.argmin(np.abs(years - 2100))
+            assert np.median(samples[:, idx]) > 0
+
+
+# =========================================================================
+# IPCC total comparison
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_IPCC, reason="IPCC AR6 data not found")
+class TestIPCCTotalComparison:
+    """Verify IPCC AR6 total projections can be loaded for comparison."""
+
+    def test_read_ipcc_total(self):
+        data = read_ipcc_component_nc(
+            CONF_BASE, 'medium_confidence', 'ssp245', 'total')
+        assert data is not None
+
+    def test_ipcc_total_structure(self):
+        data = read_ipcc_component_nc(
+            CONF_BASE, 'medium_confidence', 'ssp245', 'total')
+        if data is None:
+            pytest.skip("IPCC total not available")
+        ex = ipcc_extract(data)
+        for key in ('years', 'q50', 'q05', 'q95'):
+            assert key in ex
+
+    def test_ipcc_total_positive_at_2100(self):
+        data = read_ipcc_component_nc(
+            CONF_BASE, 'medium_confidence', 'ssp245', 'total')
+        if data is None:
+            pytest.skip("IPCC total not available")
+        ex = ipcc_extract(data)
+        idx = np.argmin(np.abs(ex['years'] - 2100))
+        assert ex['q50'][idx] > 0
+
+    def test_our_forecast_exceeds_ipcc(self):
+        """Our 2100 median should exceed the AR6 median, both on the AR6
+        1995-2014 baseline (the fast-WAIS mixture adds a WAIS tail that
+        AR6 medium confidence does not include)."""
+        data = read_ipcc_component_nc(
+            CONF_BASE, 'medium_confidence', 'ssp245', 'total')
+        if data is None or not HAS_HEADLINE:
+            pytest.skip("Need both IPCC and headline data")
+        ex = ipcc_extract(data)
+        idx = np.argmin(np.abs(ex['years'] - 2100))
+        ipcc_med_mm = ex['q50'][idx]  # mm, rel. 1995-2014
+
+        with open(HEADLINE_PATH) as f:
+            h = json.load(f)
+        ic = h['ipcc_comparison']['SSP2-4.5']
+        our_med_mm = ic['our_median_cm_ar6_baseline'] * 10
+        assert ic['ipcc_median_cm'] == pytest.approx(ipcc_med_mm / 10, abs=0.06)
+        assert our_med_mm > ipcc_med_mm, (
+            f"Our median ({our_med_mm:.0f} mm) should exceed "
+            f"IPCC ({ipcc_med_mm:.0f} mm)")
+
+
+# =========================================================================
+# Forecast plausibility (loaded from headline JSON)
+# =========================================================================
+
+@pytest.mark.skipif(not HAS_HEADLINE, reason="headline JSON not found")
+class TestForecastPlausibility:
+    """Physical plausibility checks on the blended forecast."""
+
+    @pytest.fixture(scope="class")
+    def headline(self):
+        with open(HEADLINE_PATH) as f:
+            return json.load(f)
+
+    def test_2050_less_than_2100(self, headline):
+        """Forecasts at 2050 should be less than at 2100."""
+        for ssp in PROJ_SSPS:
+            med_2050 = headline['scenarios'][ssp]['2050']['median_mm_rel_baseline']
+            med_2100 = headline['scenarios'][ssp]['2100']['median_mm_rel_baseline']
+            assert med_2050 < med_2100
+
+    def test_within_to_across_ratio(self, headline):
+        """Within-scenario should be 3-10x larger than across-scenario spread."""
+        ratio = headline.get('ratio_within_to_across', 0)
+        assert 2 < ratio < 15, f"Ratio = {ratio}, expected 2-15"
+
+    def test_2100_median_above_500mm(self, headline):
+        """All SSPs should have median > 500 mm at 2100."""
+        for ssp in PROJ_SSPS:
+            med = headline['scenarios'][ssp]['2100']['median_mm_rel_baseline']
+            assert med > 500, f"{ssp} median = {med:.0f} mm, expected > 500"
+
+    def test_uncertainty_range_reasonable(self, headline):
+        """90% CI should be 400-1500 mm wide at 2100."""
+        for ssp in PROJ_SSPS:
+            st = headline['scenarios'][ssp]['2100']
+            width = st['p95_mm_rel_baseline'] - st['p5_mm_rel_baseline']
+            assert 400 < width < 1600, (
+                f"{ssp} 90% width = {width:.0f} mm, outside [400, 1600]")
+
+    def test_early_years_converge(self, headline):
+        """At 2030, SSPs should be close (quadratic dominates)."""
+        medians_2030 = [headline['scenarios'][ssp]['2030']['median_mm_rel_baseline']
+                         for ssp in PROJ_SSPS]
+        spread = max(medians_2030) - min(medians_2030)
+        assert spread < 20, (
+            f"2030 spread = {spread:.0f} mm, expected < 20 (quadratic dominates)")
+
+
+@pytest.mark.skipif(not os.path.exists(OBS_H5_PATH), reason="slr_processed_data.h5 not found")
+def test_ar6_offset_is_relative_to_quadratic_at_baseline():
+    """The AR6 offset is the 1995-2014 mean of the smoothed NASA record minus
+    the satellite-era quadratic's level at BASELINE_YEAR, the forecast's zero
+    (component_forecast: H_ORIGIN = quad(T_ORIGIN) - quad(BASELINE_YEAR))."""
+    import pandas as pd
+    from bayesian_models import fit_satellite_era_quadratic
+    from component_analysis import ar6_baseline_offset_m
+    d = pd.read_hdf(OBS_H5_PATH, 'harmonized/df_nasa_gmsl_h')
+    t = d['decimal_year'].values
+    cov = os.path.join(PROJECT_ROOT, 'data', 'raw', 'gmslr', 'ablain2019_gmsl_error_covariance.nc')
+    q = fit_satellite_era_quadratic(time=t, gmsl=d['gmsl'].values, sigma=None,
+                                    t_start=1993.0, t_end=t[-1], eval_time=t[-1],
+                                    meas_cov_path=cov if os.path.exists(cov) else None)
+    c0, c1, c2 = q.coefficients
+    dt0 = BASELINE_YEAR - q.t_start
+    w = (t >= 1995.0) & (t < 2015.0)
+    expected = d['gmsl_smoothed'].values[w].mean() - (c0 + c1 * dt0 + c2 * dt0 ** 2)
+    assert ar6_baseline_offset_m(OBS_H5_PATH) == pytest.approx(expected, abs=1e-12)
+
