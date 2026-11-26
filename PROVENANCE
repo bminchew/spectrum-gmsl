@@ -1,8 +1,8 @@
 SPECTRUM publication export
 ===========================
-export_date_utc:      2026-11-26T05:11:12Z
+export_date_utc:      2026-11-26T05:56:52Z
 export_mode:          from-commit
-source_commit:        dcb6b978ad2e6e5f5d9bb54bdc46f3095d4b7109
+source_commit:        bd4346937f1d560ba7a35e45b798117034061abd
 shipped_dirty:        no (exported from the commit snapshot, not the working tree)
 allowlist:            publication/allowlist.txt (from commit)
 allowlist_sha256:     6b6ff4e90b06e31a17de6a69939d4f79cb496ce98fac7baa893b8968839d34ea
@@ -98,7 +98,7 @@ ccb0cdadea898f33e77b258f74940336a31acbf88debbbd84b9c0944dd694ffa  scripts/refres
 fe27c74a90534f69a0cf6127e8589b3549989b95bec4b477895a57ad5b746ee8  scripts/smb_state_space_diagnostic.py
 a9c8474b82aa04454c57ac7b99edfc8977726fd12d89ea57c137eadb323c8ddc  scripts/test_scenario_transfer_mar.py
 886f753fc161a68e26f8c3432e58b8a8f52da535cc03d423d9bb187479ee79c2  scripts/thermosteric_eos_coefficient.py
-2d2cfb197c59c422b776c8e48ec843c37f1ad375acda194e2c85afd4e26257d6  scripts/thermosteric_record_sensitivity.py
+968ebc942a18050174062c7975b852cb62109f16bead3155ef00606c43984425  scripts/thermosteric_record_sensitivity.py
 d112a28d0fd721725ce496ac0788c044f3b537fc4ee53e6d8cf80ed1f0b03462  scripts/variance_shares.py
 3c63d2e5b948e96720a6e4af23eb78feb596596059ca20672244ba8d3a5a8817  src/slr_forecast/__init__.py
 5d64784f88574a6d42100503cb596e8aa2cf78a39f8ac0a0c84bc702b8fbe155  src/slr_forecast/analysis/__init__.py
