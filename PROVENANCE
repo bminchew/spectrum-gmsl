@@ -1,12 +1,12 @@
 SPECTRUM publication export
 ===========================
-export_date_utc:      2026-11-26T00:22:14Z
+export_date_utc:      2026-11-26T05:11:12Z
 export_mode:          from-commit
-source_commit:        1e3b43055e0647331b6cebddc67202839dcdb9cb
+source_commit:        dcb6b978ad2e6e5f5d9bb54bdc46f3095d4b7109
 shipped_dirty:        no (exported from the commit snapshot, not the working tree)
 allowlist:            publication/allowlist.txt (from commit)
 allowlist_sha256:     6b6ff4e90b06e31a17de6a69939d4f79cb496ce98fac7baa893b8968839d34ea
-data_manifest_sha256: 7dd4ef99b2788d7986b8f8166e2733e49fe2db949a64c20bda9abcfdce8165fb
+data_manifest_sha256: ad8e98dc47926f8afe68b94c98b5f2922f2b4bfe617d8eeb965c02bd0d9fdbe0
 gitignore_sha256:     fd7f0a2c87c54b142823865a9101813acb141e022d437c7f7afd20ffca107b72
 exporter:             publication/export_publication.sh sha256 ab8a0fea5ca75e5de559e5f43eb924728d7a010e4283b4de65c6254a119c62e9
 checker:              publication/check_export.py sha256 caad7901d213b53269714531699d92b50a49a368af998275ee439d656d3046c4
@@ -18,8 +18,8 @@ files:                112 shipped + 8 generated (including this file)
 fd7f0a2c87c54b142823865a9101813acb141e022d437c7f7afd20ffca107b72  .gitignore
 65c42fd73178cfc5ae795d67a8a33a6e757402451dc181606b1f50c410a149d4  CITATION.cff
 584c7b825b6eaee1cad2b3d03fbcedf2f960598bc9d5d838dfa8692dde0d71fd  LICENSE
-e9706e7918da2ad60ca84a57047727258a5541ed024f52f725e08adf7eac478a  README.md
-7dd4ef99b2788d7986b8f8166e2733e49fe2db949a64c20bda9abcfdce8165fb  data/data_manifest.md
+975a7baa8af19b470686d17c9ce7a34a00eae6a08fca7452d198bedf09847096  README.md
+ad8e98dc47926f8afe68b94c98b5f2922f2b4bfe617d8eeb965c02bd0d9fdbe0  data/data_manifest.md
 da1cb03148b54c2e0457c12997b34475167c48a81a34efcf903d69d6988ca6c7  data/processed/README.md
 00f1948d751371537eed415b67459251cb580dba9443076b44e777fc99a38555  data/processed/en4_greenland_peripheral_100_400m.csv
 85fe9d4710e34e7b65217e01554f9141c7f524c95723fb362b41127605b2bda5  data/processed/en4_greenland_peripheral_200_500m.csv
